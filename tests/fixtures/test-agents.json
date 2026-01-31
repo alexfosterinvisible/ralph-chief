@@ -1,0 +1,28 @@
+{
+  "agents": {
+    "system.task-worker": {
+      "max_iterations": 20,
+      "max_turns": 50,
+      "timeout_seconds": 3600,
+      "plan_mode": false
+    },
+    "engineering.pr-comment-fix": {
+      "max_iterations": 10,
+      "max_turns": 30,
+      "auto_commit": true
+    },
+    "engineering.validation-review": {
+      "max_iterations": 5,
+      "max_turns": 50
+    }
+  },
+  "defaults": {
+    "max_iterations": 10,
+    "max_turns": 30,
+    "timeout_seconds": 3600,
+    "auto_commit": false,
+    "supervisor_interval": 2,
+    "max_restarts": 2,
+    "readonly": false
+  }
+}

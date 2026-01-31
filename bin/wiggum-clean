@@ -1,0 +1,894 @@
+#!/opt/homebrew/bin/bash
+# Clean up Chief Wiggum worktrees and worker directories
+set -euo pipefail
+
+WIGGUM_HOME="${WIGGUM_HOME:-$HOME/.claude/chief-wiggum}"
+source "$WIGGUM_HOME/lib/core/bin-common.sh"
+source "$WIGGUM_HOME/lib/core/file-lock.sh"
+source "$WIGGUM_HOME/lib/worker/worker-lifecycle.sh"
+source "$WIGGUM_HOME/lib/tasks/task-parser.sh"
+
+SKIP_CONFIRM=false
+
+show_help() {
+    cat << EOF
+wiggum clean - Clean up workspaces, logs, or reset kanban tasks
+
+Usage: wiggum clean [options] <target>
+       wiggum clean logs [all|done|<pattern>]
+       wiggum clean archive [all|done|<pattern>]
+       wiggum clean kanban [all|<task-id>]
+       wiggum clean batch [all|stale|<batch-id>]
+
+Workspace Targets (removes worktree only, preserves logs):
+  <pattern>           Clean workspace of workers matching pattern (e.g., TASK-001, 030)
+  <p1>,<p2>,...       Clean multiple patterns (comma-separated)
+  all                 Clean workspaces of finished [x] tasks
+  done                Clean workspaces of workers whose PRs have been merged
+
+Log Targets (removes entire worker directory including logs):
+  logs all            Remove entire worker directories of finished [x] tasks
+  logs done           Remove entire directories of workers with merged PRs
+  logs <pattern>      Remove entire worker directory matching pattern
+
+Archive Targets (moves worker directory to .ralph/history/workers/):
+  archive all         Archive worker directories of finished [x] tasks
+  archive done        Archive directories of workers with merged PRs
+  archive <pattern>   Archive worker directory matching pattern
+
+Kanban Targets:
+  kanban all          Reset resettable tasks (in-progress, pending approval, failed)
+  kanban <task-id>    Reset a specific task if it's in a resettable state
+
+Batch Targets:
+  batch all           Clean all batch coordination files and planner directories
+  batch stale         Clean stale batches (merged workers, orphaned contexts)
+  batch <batch-id>    Clean a specific batch by ID
+
+Options:
+  -v, --verbose       Verbose output (same as default)
+  -vv                 Debug output (detailed diagnostics)
+  -vvv                Trace output (very detailed tracing)
+  -q, --quiet         Quiet mode (warnings and errors only)
+  -y, --yes           Skip confirmation prompt
+  -h, --help          Show this help message
+
+Examples:
+  wiggum clean all            # Clean workspaces of finished [x] tasks (preserves logs)
+  wiggum clean TASK-001       # Clean workspace of TASK-001 (preserves logs)
+  wiggum clean done           # Clean workspaces of workers with merged PRs
+  wiggum clean logs all       # Remove entire worker directories of finished tasks
+  wiggum clean logs TASK-001  # Remove entire worker directory of TASK-001
+  wiggum clean archive all    # Archive worker directories to .ralph/history/
+  wiggum clean archive 001    # Archive specific worker to history
+  wiggum clean -y all         # Clean workspaces without confirmation
+  wiggum clean kanban all     # Reset all resettable tasks in kanban
+  wiggum clean batch stale    # Clean stale batch state (recommended)
+
+EOF
+}
+
+log() {
+    echo "[$(date -Iseconds)] $*"
+}
+
+confirm() {
+    local prompt="$1"
+    [ "$SKIP_CONFIRM" = true ] && return 0
+    read -r -p "$prompt [y/N] " response
+    [[ "$response" =~ ^[yY]([eE][sS])?$ ]]
+}
+
+# Check if a PR is merged
+is_pr_merged() {
+    local pr_url="$1"
+    [ -z "$pr_url" ] || [ "$pr_url" = "N/A" ] && return 1
+    command -v gh &>/dev/null || return 1
+
+    local pr_state
+    pr_state=$(gh pr view "$pr_url" --json state -q .state 2>/dev/null) || return 1
+    [ "$pr_state" = "MERGED" ]
+}
+
+# Find workers with merged PRs
+find_workers_with_merged_prs() {
+    [ -d "$RALPH_DIR/workers" ] || return
+
+    for dir in "$RALPH_DIR/workers"/worker-*; do
+        [ -d "$dir" ] || continue
+        local pr_url_file="$dir/pr_url.txt"
+        [ -f "$pr_url_file" ] || continue
+
+        if is_pr_merged "$(cat "$pr_url_file")"; then
+            basename "$dir"
+        fi
+    done
+}
+
+# Remove workspace only (preserves logs)
+clean_worker_workspace() {
+    local worker_name="$1"
+    local worker_dir="$RALPH_DIR/workers/$worker_name"
+
+    if [ -d "$worker_dir/workspace" ]; then
+        log "Removing worktree: $worker_dir/workspace"
+        git worktree remove "$worker_dir/workspace" --force 2>/dev/null || true
+    else
+        log "No workspace found for $worker_name"
+    fi
+}
+
+# Remove entire worker directory (including logs)
+clean_worker_full() {
+    local worker_name="$1"
+    local worker_dir="$RALPH_DIR/workers/$worker_name"
+
+    if [ -d "$worker_dir/workspace" ]; then
+        log "Removing worktree: $worker_dir/workspace"
+        git worktree remove "$worker_dir/workspace" --force 2>/dev/null || true
+    fi
+
+    if [ -d "$worker_dir" ]; then
+        log "Removing worker directory: $worker_name"
+        rm -rf "$worker_dir"
+    fi
+}
+
+# Archive worker directory to .ralph/history/workers/
+archive_worker() {
+    local worker_name="$1"
+    local worker_dir="$RALPH_DIR/workers/$worker_name"
+    local history_dir="$RALPH_DIR/history/workers"
+
+    # Remove workspace first (worktree)
+    if [ -d "$worker_dir/workspace" ]; then
+        log "Removing worktree: $worker_dir/workspace"
+        git worktree remove "$worker_dir/workspace" --force 2>/dev/null || true
+    fi
+
+    if [ -d "$worker_dir" ]; then
+        # Ensure history directory exists
+        mkdir -p "$history_dir"
+
+        log "Archiving worker: $worker_name -> .ralph/history/workers/"
+        mv "$worker_dir" "$history_dir/"
+    fi
+}
+
+# Archive workers (move to history)
+do_archive() {
+    local workers=("$@")
+
+    for worker in "${workers[@]}"; do
+        archive_worker "$worker"
+    done
+
+    git worktree prune 2>/dev/null
+    log "Archived ${#workers[@]} worker(s) to .ralph/history/workers/"
+}
+
+# Resolve patterns to worker directories
+resolve_patterns() {
+    local input="$1"
+    local resolved=()
+
+    IFS=',' read -ra patterns <<< "$input"
+    for pattern in "${patterns[@]}"; do
+        pattern=$(echo "$pattern" | xargs)
+        [ -z "$pattern" ] && continue
+
+        local matches
+        matches=$(find_workers_by_pattern "$RALPH_DIR" "$pattern")
+
+        if [ -z "$matches" ]; then
+            echo "No workers found matching: $pattern" >&2
+            return 1
+        fi
+
+        local match_count
+        match_count=$(echo "$matches" | wc -l | tr -d '[:space:]')
+
+        if [ "$match_count" -gt 1 ]; then
+            echo "Multiple workers match '$pattern':" >&2
+            sed 's/^/  /' <<< "$matches" >&2
+            echo "Please be more specific." >&2
+            return 1
+        fi
+
+        resolved+=("$(echo "$matches" | head -1)")
+    done
+
+    printf '%s\n' "${resolved[@]}"
+}
+
+# Clean workspaces only (default behavior - preserves logs)
+do_clean_workspaces() {
+    local workers=("$@")
+
+    for worker in "${workers[@]}"; do
+        clean_worker_workspace "$worker"
+    done
+
+    git worktree prune 2>/dev/null
+    log "Cleaned workspaces of ${#workers[@]} worker(s) (logs preserved)"
+    echo ""
+    log "Current status:"
+    git worktree list
+}
+
+# Clean entire worker directories (including logs)
+do_clean_full() {
+    local workers=("$@")
+
+    for worker in "${workers[@]}"; do
+        clean_worker_full "$worker"
+    done
+
+    git worktree prune 2>/dev/null
+    log "Removed ${#workers[@]} worker(s) including logs"
+    echo ""
+    log "Current status:"
+    git worktree list
+}
+
+# Find workers for tasks marked as complete [x] in kanban
+find_workers_for_finished_tasks() {
+    local kanban_file="$RALPH_DIR/kanban.md"
+
+    [ -f "$kanban_file" ] || return
+    [ -d "$RALPH_DIR/workers" ] || return
+
+    # Get completed task IDs from kanban
+    local completed_tasks
+    completed_tasks=$(grep -E '^\s*-\s*\[x\].*\*\*\[([A-Za-z]{2,10}-[0-9]{1,4})\]\*\*' "$kanban_file" \
+        | sed -E 's/.*\*\*\[([A-Za-z]{2,10}-[0-9]{1,4})\]\*\*.*/\1/' || true)
+
+    [ -z "$completed_tasks" ] && return
+
+    # Find workers matching completed tasks
+    while IFS= read -r task_id; do
+        [ -z "$task_id" ] && continue
+        for dir in "${RALPH_DIR}/workers/worker-${task_id}-"*; do
+            [ -d "$dir" ] && basename "$dir"
+        done
+    done <<< "$completed_tasks"
+}
+
+# Status character to human-readable name
+status_name() {
+    case "$1" in
+        " ") echo "pending" ;;
+        "=") echo "in-progress" ;;
+        "P") echo "pending approval" ;;
+        "x") echo "complete" ;;
+        "*") echo "failed" ;;
+        "N") echo "not planned" ;;
+        *)   echo "unknown" ;;
+    esac
+}
+
+# Reset kanban tasks to pending
+do_kanban_reset() {
+    local kanban_file="$1"
+    shift
+    local tasks=("$@")
+
+    for task_id in "${tasks[@]}"; do
+        log "Resetting $task_id to pending"
+        update_kanban_status "$kanban_file" "$task_id" " "
+    done
+
+    log "Reset ${#tasks[@]} task(s) to pending"
+}
+
+# Handle 'wiggum clean kanban all'
+do_kanban_all() {
+    local kanban_file="$RALPH_DIR/kanban.md"
+
+    [ -f "$kanban_file" ] || {
+        echo "ERROR: No kanban file found at $kanban_file"
+        exit $EXIT_WORKER_NO_KANBAN
+    }
+
+    local wip_tasks failed_tasks pending_approval_tasks
+    wip_tasks=$(get_in_progress_tasks "$kanban_file")
+    failed_tasks=$(get_failed_tasks "$kanban_file")
+    pending_approval_tasks=$(get_pending_approval_tasks "$kanban_file")
+
+    local wip_count=0 failed_count=0 pa_count=0
+    [ -n "$wip_tasks" ] && wip_count=$(echo "$wip_tasks" | wc -l | tr -d '[:space:]')
+    [ -n "$failed_tasks" ] && failed_count=$(echo "$failed_tasks" | wc -l | tr -d '[:space:]')
+    [ -n "$pending_approval_tasks" ] && pa_count=$(echo "$pending_approval_tasks" | wc -l | tr -d '[:space:]')
+
+    echo "Resettable tasks in kanban:"
+    echo "  [=] In-progress:      $wip_count"
+    echo "  [P] Pending approval: $pa_count"
+    echo "  [*] Failed:           $failed_count"
+    echo ""
+
+    if [ "$wip_count" -eq 0 ] && [ "$pa_count" -eq 0 ] && [ "$failed_count" -eq 0 ]; then
+        echo "No tasks to reset."
+        exit $EXIT_OK
+    fi
+
+    local tasks_to_reset=()
+
+    [ -n "$wip_tasks" ] && while IFS= read -r task; do
+        tasks_to_reset+=("$task")
+    done <<< "$wip_tasks"
+
+    if [ "$pa_count" -gt 0 ] || [ "$failed_count" -gt 0 ]; then
+        if [ "$SKIP_CONFIRM" = true ] || confirm "Also reset [P] pending approval and [*] failed tasks?"; then
+            [ -n "$failed_tasks" ] && while IFS= read -r task; do
+                tasks_to_reset+=("$task")
+            done <<< "$failed_tasks"
+            [ -n "$pending_approval_tasks" ] && while IFS= read -r task; do
+                tasks_to_reset+=("$task")
+            done <<< "$pending_approval_tasks"
+        fi
+    fi
+
+    [ ${#tasks_to_reset[@]} -eq 0 ] && {
+        echo "No tasks selected for reset."
+        exit $EXIT_OK
+    }
+
+    echo "The following tasks will be reset to pending [ ]:"
+    for task in "${tasks_to_reset[@]}"; do
+        local status
+        status=$(get_task_status "$kanban_file" "$task")
+        echo "  [$status] $task"
+    done
+    echo ""
+
+    confirm "Proceed with reset?" || {
+        echo "Aborted."
+        exit $EXIT_OK
+    }
+
+    do_kanban_reset "$kanban_file" "${tasks_to_reset[@]}"
+}
+
+# Clean orphaned batch-context.json files from workers
+# These are left behind when PRs are merged independently
+clean_orphaned_batch_contexts() {
+    local cleaned=0
+
+    [ -d "$RALPH_DIR/workers" ] || return 0
+
+    for worker_dir in "$RALPH_DIR/workers"/worker-*; do
+        [ -d "$worker_dir" ] || continue
+        [ -f "$worker_dir/batch-context.json" ] || continue
+
+        local task_id
+        task_id=$(basename "$worker_dir" | sed -E 's/worker-([A-Za-z]{2,10}-[0-9]{1,4})-.*/\1/')
+
+        # Check if workspace is gone (PR was merged and cleaned up)
+        if [ ! -d "$worker_dir/workspace" ]; then
+            log "Removing orphaned batch-context.json from $task_id (workspace cleaned up)"
+            rm -f "$worker_dir/batch-context.json"
+            ((++cleaned)) || true
+            continue
+        fi
+
+        # Check if worker is in terminal state
+        local state
+        state=$(cat "$worker_dir/git-state.json" 2>/dev/null | jq -r '.state // .current_state // "unknown"')
+        if [[ "$state" == "merged" || "$state" == "failed" ]]; then
+            log "Removing orphaned batch-context.json from $task_id (state: $state)"
+            rm -f "$worker_dir/batch-context.json"
+            ((++cleaned)) || true
+        fi
+    done
+
+    echo "Cleaned $cleaned orphaned batch context file(s)"
+}
+
+# Clean stale batch coordination files
+clean_stale_batches() {
+    local cleaned=0
+
+    [ -d "$RALPH_DIR/batches" ] || return 0
+
+    for batch_dir in "$RALPH_DIR/batches"/batch-*; do
+        [ -d "$batch_dir" ] || continue
+
+        local coord_file="$batch_dir/coordination.json"
+        [ -f "$coord_file" ] || continue
+
+        local batch_id status
+        batch_id=$(basename "$batch_dir")
+        status=$(jq -r '.status // "unknown"' "$coord_file")
+
+        # Clean completed or failed batches
+        if [[ "$status" == "complete" || "$status" == "failed" ]]; then
+            log "Removing $batch_id (status: $status)"
+            rm -rf "$batch_dir"
+            ((++cleaned)) || true
+            continue
+        fi
+
+        # Check if batch is stale (all tasks merged/failed)
+        local all_done=true
+        local task_ids
+        task_ids=$(jq -r '.order[]' "$coord_file" 2>/dev/null)
+
+        while read -r task_id; do
+            [ -z "$task_id" ] && continue
+            local worker_dir
+            worker_dir=$(find "$RALPH_DIR/workers" -maxdepth 1 -type d -name "worker-${task_id}-*" | head -1)
+
+            if [ -n "$worker_dir" ] && [ -d "$worker_dir" ]; then
+                local state
+                state=$(cat "$worker_dir/git-state.json" 2>/dev/null | jq -r '.state // .current_state // "unknown"')
+                if [[ "$state" != "merged" && "$state" != "failed" ]]; then
+                    all_done=false
+                    break
+                fi
+            fi
+        done <<< "$task_ids"
+
+        if [ "$all_done" = true ]; then
+            log "Removing stale $batch_id (all tasks in terminal state)"
+            rm -rf "$batch_dir"
+            ((++cleaned)) || true
+        fi
+    done
+
+    echo "Cleaned $cleaned stale batch coordination file(s)"
+}
+
+# Clean planner directories
+clean_planners() {
+    local cleaned=0
+
+    [ -d "$RALPH_DIR/workers" ] || return 0
+
+    for planner_dir in "$RALPH_DIR/workers"/planner-batch-*; do
+        [ -d "$planner_dir" ] || continue
+
+        local batch_id
+        batch_id=$(basename "$planner_dir" | sed 's/^planner-//')
+
+        # Check if planner is still running
+        local pid_file="$planner_dir/planner.pid"
+        if [ -f "$pid_file" ]; then
+            local pid
+            pid=$(cat "$pid_file")
+            if kill -0 "$pid" 2>/dev/null; then
+                log "Skipping $batch_id (planner still running, PID: $pid)"
+                continue
+            fi
+        fi
+
+        # Check if corresponding batch exists
+        if [ ! -d "$RALPH_DIR/batches/$batch_id" ]; then
+            log "Removing planner-$batch_id (batch no longer exists)"
+            rm -rf "$planner_dir"
+            ((++cleaned)) || true
+        fi
+    done
+
+    echo "Cleaned $cleaned planner director(ies)"
+}
+
+# Handle 'wiggum clean batch all'
+do_batch_all() {
+    echo "This will clean ALL batch coordination state:"
+    echo "  - All batch coordination files in .ralph/batches/"
+    echo "  - All batch-context.json files in worker directories"
+    echo "  - All planner directories"
+    echo ""
+
+    confirm "Proceed with batch cleanup?" || {
+        echo "Aborted."
+        exit $EXIT_OK
+    }
+
+    # Clean batch directories
+    if [ -d "$RALPH_DIR/batches" ]; then
+        local batch_count
+        batch_count=$(find "$RALPH_DIR/batches" -maxdepth 1 -type d -name "batch-*" 2>/dev/null | wc -l)
+        rm -rf "$RALPH_DIR/batches"/batch-*
+        log "Removed $batch_count batch coordination director(ies)"
+    fi
+
+    # Clean all batch-context.json files
+    local context_count=0
+    for worker_dir in "$RALPH_DIR/workers"/worker-*; do
+        [ -f "$worker_dir/batch-context.json" ] && {
+            rm -f "$worker_dir/batch-context.json"
+            ((++context_count)) || true
+        }
+    done
+    log "Removed $context_count batch context file(s)"
+
+    # Clean planner directories
+    local planner_count
+    planner_count=$(find "$RALPH_DIR/workers" -maxdepth 1 -type d -name "planner-batch-*" 2>/dev/null | wc -l)
+    rm -rf "$RALPH_DIR/workers"/planner-batch-*
+    log "Removed $planner_count planner director(ies)"
+
+    log "Batch cleanup complete"
+}
+
+# Handle 'wiggum clean batch stale'
+do_batch_stale() {
+    echo "Cleaning stale batch coordination state..."
+    echo ""
+
+    clean_orphaned_batch_contexts
+    clean_stale_batches
+    clean_planners
+
+    log "Stale batch cleanup complete"
+}
+
+# Handle 'wiggum clean batch <batch-id>'
+do_batch_specific() {
+    local batch_id="$1"
+
+    # Normalize batch_id (add batch- prefix if missing)
+    [[ "$batch_id" != batch-* ]] && batch_id="batch-$batch_id"
+
+    local batch_dir="$RALPH_DIR/batches/$batch_id"
+
+    if [ ! -d "$batch_dir" ]; then
+        echo "Batch not found: $batch_id"
+        echo ""
+        echo "Available batches:"
+        if [ -d "$RALPH_DIR/batches" ]; then
+            ls -1 "$RALPH_DIR/batches" 2>/dev/null | sed 's/^/  /' || echo "  (none)"
+        else
+            echo "  (none)"
+        fi
+        exit $EXIT_USAGE
+    fi
+
+    # Show batch info
+    local coord_file="$batch_dir/coordination.json"
+    if [ -f "$coord_file" ]; then
+        echo "Batch: $batch_id"
+        echo "Status: $(jq -r '.status' "$coord_file")"
+        echo "Tasks: $(jq -r '.order | join(", ")' "$coord_file")"
+        echo "Progress: $(jq -r '.current_position' "$coord_file")/$(jq -r '.total' "$coord_file")"
+        echo ""
+    fi
+
+    confirm "Remove this batch and its worker context files?" || {
+        echo "Aborted."
+        exit $EXIT_OK
+    }
+
+    # Remove batch directory
+    rm -rf "$batch_dir"
+    log "Removed $batch_dir"
+
+    # Remove batch-context.json from associated workers
+    local task_ids
+    task_ids=$(jq -r '.order[]' "$coord_file" 2>/dev/null || true)
+
+    while read -r task_id; do
+        [ -z "$task_id" ] && continue
+        for worker_dir in "$RALPH_DIR/workers"/worker-${task_id}-*; do
+            [ -f "$worker_dir/batch-context.json" ] && {
+                rm -f "$worker_dir/batch-context.json"
+                log "Removed batch context from $(basename "$worker_dir")"
+            }
+        done
+    done <<< "$task_ids"
+
+    # Remove planner if exists
+    local planner_dir="$RALPH_DIR/workers/planner-$batch_id"
+    [ -d "$planner_dir" ] && {
+        rm -rf "$planner_dir"
+        log "Removed planner-$batch_id"
+    }
+
+    log "Batch $batch_id cleanup complete"
+}
+
+# Handle 'wiggum clean kanban <task-id>'
+do_kanban_task() {
+    local task_pattern="$1"
+    local kanban_file="$RALPH_DIR/kanban.md"
+
+    [ -f "$kanban_file" ] || {
+        echo "ERROR: No kanban file found at $kanban_file"
+        exit $EXIT_WORKER_NO_KANBAN
+    }
+
+    local task_id
+    task_id=$(resolve_task_id "$kanban_file" "$task_pattern") || exit $EXIT_WORKER_TASK_NOT_FOUND
+
+    local status
+    status=$(get_task_status "$kanban_file" "$task_id")
+
+    case "$status" in
+        "="|"P"|"*")
+            echo "Task $task_id is currently $(status_name "$status") [$status]"
+            echo ""
+            confirm "Reset to pending [ ]?" || {
+                echo "Aborted."
+                exit $EXIT_OK
+            }
+            do_kanban_reset "$kanban_file" "$task_id"
+            ;;
+        *)
+            echo "Task $task_id is $(status_name "$status") [$status] - not a resettable state."
+            echo "Resettable states: [=] in-progress, [P] pending approval, [*] failed"
+            exit $EXIT_USAGE
+            ;;
+    esac
+}
+
+# Parse verbose flags first
+WIGGUM_REMAINING_ARGS=(); parse_verbose_flags "$@"
+set -- ${WIGGUM_REMAINING_ARGS[@]:+"${WIGGUM_REMAINING_ARGS[@]}"}
+
+# Parse options
+TARGET=""
+KANBAN_TARGET=""
+BATCH_TARGET=""
+LOGS_TARGET=""
+ARCHIVE_TARGET=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -y|--yes)
+            SKIP_CONFIRM=true
+            shift
+            ;;
+        -h|--help)
+            show_help
+            exit $EXIT_OK
+            ;;
+        -*)
+            echo "Unknown option: $1"
+            show_help
+            exit $EXIT_USAGE
+            ;;
+        kanban)
+            TARGET="kanban"
+            shift
+            [[ $# -gt 0 ]] && [[ ! "$1" =~ ^- ]] && {
+                KANBAN_TARGET="$1"
+                shift
+            }
+            ;;
+        batch)
+            TARGET="batch"
+            shift
+            [[ $# -gt 0 ]] && [[ ! "$1" =~ ^- ]] && {
+                BATCH_TARGET="$1"
+                shift
+            }
+            ;;
+        logs)
+            TARGET="logs"
+            shift
+            [[ $# -gt 0 ]] && [[ ! "$1" =~ ^- ]] && {
+                LOGS_TARGET="$1"
+                shift
+            }
+            ;;
+        archive)
+            TARGET="archive"
+            shift
+            [[ $# -gt 0 ]] && [[ ! "$1" =~ ^- ]] && {
+                ARCHIVE_TARGET="$1"
+                shift
+            }
+            ;;
+        *)
+            [ -z "$TARGET" ] && TARGET="$1" || {
+                echo "Unexpected argument: $1"
+                exit $EXIT_USAGE
+            }
+            shift
+            ;;
+    esac
+done
+
+[ -z "$TARGET" ] && {
+    echo "No target specified. Use 'wiggum clean <pattern>' or 'wiggum clean all'."
+    show_help
+    exit $EXIT_OK
+}
+
+[ -d "$RALPH_DIR" ] || {
+    echo "ERROR: .ralph/ directory not found"
+    exit $EXIT_CLEAN_NO_RALPH_DIR
+}
+
+# Handle kanban subcommand
+if [ "$TARGET" = "kanban" ]; then
+    [ -z "$KANBAN_TARGET" ] && {
+        echo "No kanban target specified. Use 'wiggum clean kanban all' or 'wiggum clean kanban <task-id>'."
+        show_help
+        exit $EXIT_USAGE
+    }
+
+    [ "$KANBAN_TARGET" = "all" ] && do_kanban_all || do_kanban_task "$KANBAN_TARGET"
+    exit $EXIT_OK
+fi
+
+# Handle batch subcommand
+if [ "$TARGET" = "batch" ]; then
+    [ -z "$BATCH_TARGET" ] && {
+        echo "No batch target specified. Use 'wiggum clean batch all', 'wiggum clean batch stale', or 'wiggum clean batch <batch-id>'."
+        show_help
+        exit $EXIT_USAGE
+    }
+
+    case "$BATCH_TARGET" in
+        all)
+            do_batch_all
+            ;;
+        stale)
+            do_batch_stale
+            ;;
+        *)
+            do_batch_specific "$BATCH_TARGET"
+            ;;
+    esac
+    exit $EXIT_OK
+fi
+
+# Handle logs subcommand (full removal including logs)
+if [ "$TARGET" = "logs" ]; then
+    [ -z "$LOGS_TARGET" ] && {
+        echo "No logs target specified. Use 'wiggum clean logs all', 'wiggum clean logs done', or 'wiggum clean logs <pattern>'."
+        show_help
+        exit $EXIT_USAGE
+    }
+
+    # Determine workers for logs cleanup
+    if [ "$LOGS_TARGET" = "all" ]; then
+        workers_to_clean=$(find_workers_for_finished_tasks)
+        [ -z "$workers_to_clean" ] && {
+            echo "No workers found for finished [x] tasks."
+            exit $EXIT_OK
+        }
+    elif [ "$LOGS_TARGET" = "done" ]; then
+        echo "Checking PR status for all workers (this may take a moment)..."
+        workers_to_clean=$(find_workers_with_merged_prs)
+    else
+        workers_to_clean=$(resolve_patterns "$LOGS_TARGET") || exit $EXIT_CLEAN_PATTERN_NOT_FOUND
+    fi
+
+    [ -z "$workers_to_clean" ] && {
+        echo "No workers to clean."
+        exit $EXIT_OK
+    }
+
+    mapfile -t workers_array <<< "$workers_to_clean"
+
+    # Check for running workers
+    running_workers=()
+    for worker in "${workers_array[@]}"; do
+        is_worker_running "$RALPH_DIR/workers/$worker" && running_workers+=("$worker")
+    done
+
+    [ ${#running_workers[@]} -gt 0 ] && {
+        echo "ERROR: Cannot clean running workers. Stop them first with 'wiggum stop <id>'."
+        echo ""
+        echo "Running workers:"
+        printf '  %s\n' "${running_workers[@]}"
+        exit $EXIT_CLEAN_WORKERS_RUNNING
+    }
+
+    echo "The following worker directories will be FULLY removed (including logs):"
+    printf '  %s\n' "${workers_array[@]}"
+    echo ""
+
+    confirm "Proceed with full cleanup (including logs)?" || {
+        echo "Aborted."
+        exit $EXIT_OK
+    }
+
+    do_clean_full "${workers_array[@]}"
+    exit $EXIT_OK
+fi
+
+# Handle archive subcommand (move to history)
+if [ "$TARGET" = "archive" ]; then
+    [ -z "$ARCHIVE_TARGET" ] && {
+        echo "No archive target specified. Use 'wiggum clean archive all', 'wiggum clean archive done', or 'wiggum clean archive <pattern>'."
+        show_help
+        exit $EXIT_USAGE
+    }
+
+    # Determine workers for archiving
+    if [ "$ARCHIVE_TARGET" = "all" ]; then
+        workers_to_archive=$(find_workers_for_finished_tasks)
+        [ -z "$workers_to_archive" ] && {
+            echo "No workers found for finished [x] tasks."
+            exit $EXIT_OK
+        }
+    elif [ "$ARCHIVE_TARGET" = "done" ]; then
+        echo "Checking PR status for all workers (this may take a moment)..."
+        workers_to_archive=$(find_workers_with_merged_prs)
+    else
+        workers_to_archive=$(resolve_patterns "$ARCHIVE_TARGET") || exit $EXIT_CLEAN_PATTERN_NOT_FOUND
+    fi
+
+    [ -z "$workers_to_archive" ] && {
+        echo "No workers to archive."
+        exit $EXIT_OK
+    }
+
+    mapfile -t workers_array <<< "$workers_to_archive"
+
+    # Check for running workers
+    running_workers=()
+    for worker in "${workers_array[@]}"; do
+        is_worker_running "$RALPH_DIR/workers/$worker" && running_workers+=("$worker")
+    done
+
+    [ ${#running_workers[@]} -gt 0 ] && {
+        echo "ERROR: Cannot archive running workers. Stop them first with 'wiggum stop <id>'."
+        echo ""
+        echo "Running workers:"
+        printf '  %s\n' "${running_workers[@]}"
+        exit $EXIT_CLEAN_WORKERS_RUNNING
+    }
+
+    echo "The following workers will be archived to .ralph/history/workers/:"
+    printf '  %s\n' "${workers_array[@]}"
+    echo ""
+
+    confirm "Proceed with archiving?" || {
+        echo "Aborted."
+        exit $EXIT_OK
+    }
+
+    do_archive "${workers_array[@]}"
+    exit $EXIT_OK
+fi
+
+# Determine workers to clean (workspace only - default behavior)
+if [ "$TARGET" = "all" ]; then
+    workers_to_clean=$(find_workers_for_finished_tasks)
+    [ -z "$workers_to_clean" ] && {
+        echo "No workers found for finished [x] tasks."
+        exit $EXIT_OK
+    }
+elif [ "$TARGET" = "done" ]; then
+    echo "Checking PR status for all workers (this may take a moment)..."
+    workers_to_clean=$(find_workers_with_merged_prs)
+else
+    workers_to_clean=$(resolve_patterns "$TARGET") || exit $EXIT_CLEAN_PATTERN_NOT_FOUND
+fi
+
+[ -z "$workers_to_clean" ] && {
+    echo "No workers to clean."
+    exit $EXIT_OK
+}
+
+mapfile -t workers_array <<< "$workers_to_clean"
+
+# Check for running workers
+running_workers=()
+for worker in "${workers_array[@]}"; do
+    is_worker_running "$RALPH_DIR/workers/$worker" && running_workers+=("$worker")
+done
+
+[ ${#running_workers[@]} -gt 0 ] && {
+    echo "ERROR: Cannot clean running workers. Stop them first with 'wiggum stop <id>'."
+    echo ""
+    echo "Running workers:"
+    printf '  %s\n' "${running_workers[@]}"
+    exit $EXIT_CLEAN_WORKERS_RUNNING
+}
+
+# Confirm and clean workspaces only
+echo "The following worker workspaces will be removed (logs preserved):"
+printf '  %s\n' "${workers_array[@]}"
+echo ""
+
+confirm "Proceed with workspace cleanup?" || {
+    echo "Aborted."
+    exit $EXIT_OK
+}
+
+do_clean_workspaces "${workers_array[@]}"

@@ -1,0 +1,885 @@
+#!/opt/homebrew/bin/bash
+# Chief Wiggum - Kanban validation command
+set -euo pipefail
+
+WIGGUM_HOME="${WIGGUM_HOME:-$HOME/.claude/chief-wiggum}"
+source "$WIGGUM_HOME/lib/core/bin-common.sh"
+source "$WIGGUM_HOME/lib/core/logger.sh"
+source "$WIGGUM_HOME/lib/core/file-lock.sh"
+
+# Validation error tracking
+declare -a VALIDATION_ERRORS=()
+VALID=true
+
+# Task summary tracking
+declare -i TASK_COUNT_TODO=0
+declare -i TASK_COUNT_DONE=0
+declare -i TASK_COUNT_IN_PROGRESS=0
+declare -i TASK_COUNT_PENDING_APPROVAL=0
+declare -i TASK_COUNT_NOT_PLANNED=0
+declare -i TASK_COUNT_FAILED=0
+declare -i TASK_COUNT_TOTAL=0
+declare -i PRIORITY_CRITICAL=0
+declare -i PRIORITY_HIGH=0
+declare -i PRIORITY_MEDIUM=0
+declare -i PRIORITY_LOW=0
+
+show_help() {
+    cat << EOF
+wiggum validate - Validate kanban.md format and structure
+
+Usage: wiggum validate [options]
+       wiggum validate sort [options]
+
+Subcommands:
+  sort              Validate and sort kanban tasks by status and task ID
+  cleanup           Collapse completed [x] tasks into a summary line
+
+Options:
+  -v, --verbose     Verbose output (same as default)
+  -vv               Debug output (detailed diagnostics)
+  -vvv              Trace output (very detailed tracing)
+  -q, --quiet       Only output errors, no success message
+  -f, --file FILE   Validate a specific kanban file (default: .ralph/kanban.md)
+  -h, --help        Show this help message
+
+Validates:
+  - Task ID format ([A-Za-z]{2,10}-[0-9]{1,4})
+  - Required fields (Description, Priority)
+  - Priority values (CRITICAL, HIGH, MEDIUM, LOW)
+  - Unique task IDs
+  - Dependency references exist
+  - Proper indentation (2 spaces for fields, 4 spaces for sub-items)
+  - TASKS section exists
+
+Sort Order:
+  1. [x] Complete tasks (top)
+  2. [*] Failed tasks
+  3. [P] Pending approval tasks
+  4. [ ] and [=] Pending/In-progress tasks (sorted by task ID)
+  5. [N] Not planned tasks (bottom)
+
+Examples:
+  wiggum validate                          # Validate .ralph/kanban.md
+  wiggum validate -f custom-kanban.md      # Validate specific file
+  wiggum validate --quiet                  # Only show errors
+  wiggum validate sort                     # Validate and sort kanban
+  wiggum validate sort -f custom.md        # Sort specific file
+  wiggum validate cleanup                  # Collapse completed tasks
+  wiggum validate cleanup -f custom.md     # Cleanup specific file
+
+Exit codes:
+  0  - Kanban file is valid (or sorted successfully)
+  2  - Usage/argument error
+  30 - File not found
+  31 - Validation errors found
+
+EOF
+}
+
+add_error() {
+    local line_num="$1"
+    local message="$2"
+    VALIDATION_ERRORS+=("Line $line_num: $message")
+    VALID=false
+}
+
+show_summary() {
+    echo "Task Summary"
+    echo "============"
+    echo ""
+    echo "By Status:"
+    printf "  %-20s %3d\n" "Done [x]:" "$TASK_COUNT_DONE"
+    printf "  %-20s %3d\n" "Pending Approval [P]:" "$TASK_COUNT_PENDING_APPROVAL"
+    printf "  %-20s %3d\n" "In Progress [=]:" "$TASK_COUNT_IN_PROGRESS"
+    printf "  %-20s %3d\n" "TODO [ ]:" "$TASK_COUNT_TODO"
+    printf "  %-20s %3d\n" "Failed [*]:" "$TASK_COUNT_FAILED"
+    printf "  %-20s %3d\n" "Not Planned [N]:" "$TASK_COUNT_NOT_PLANNED"
+    echo "  --------------------"
+    printf "  %-20s %3d\n" "Total:" "$TASK_COUNT_TOTAL"
+    echo ""
+    echo "By Priority:"
+    printf "  %-20s %3d\n" "CRITICAL:" "$PRIORITY_CRITICAL"
+    printf "  %-20s %3d\n" "HIGH:" "$PRIORITY_HIGH"
+    printf "  %-20s %3d\n" "MEDIUM:" "$PRIORITY_MEDIUM"
+    printf "  %-20s %3d\n" "LOW:" "$PRIORITY_LOW"
+    echo ""
+}
+
+validate_kanban() {
+    local kanban_file="$1"
+
+    if [ ! -f "$kanban_file" ]; then
+        echo "Error: Kanban file not found: $kanban_file" >&2
+        return $EXIT_VALIDATE_FILE_NOT_FOUND
+    fi
+
+    local line_num=0
+    local in_tasks_section=false
+    local current_task_id=""
+    local current_task_line=0
+    local has_description=false
+    local has_priority=false
+    local in_scope=false
+    local in_oos=false
+    local in_ac=false
+
+    # Track all task IDs for uniqueness and dependency validation
+    declare -A task_ids=()
+    declare -a all_task_ids=()
+    declare -A task_dependencies=()
+
+    # First pass: collect all task IDs and their dependencies
+    while IFS= read -r line || [ -n "$line" ]; do
+        ((++line_num))
+
+        # Check for TASKS section
+        if [[ "$line" =~ ^##[[:space:]]+TASKS[[:space:]]*$ ]]; then
+            in_tasks_section=true
+            continue
+        fi
+
+        # Skip if not in TASKS section
+        if [ "$in_tasks_section" = false ]; then
+            continue
+        fi
+
+        # Skip non-TASKS section headers (but continue parsing — tasks may span multiple ## sections)
+        if [[ "$line" =~ ^##+ ]]; then
+            continue
+        fi
+
+        # Parse done comment (collapsed completed tasks from cleanup)
+        if [[ "$line" =~ ^\<!--[[:space:]]*done:[[:space:]]*(.*)[[:space:]]*--\>$ ]]; then
+            local done_csv="${BASH_REMATCH[1]}"
+            IFS=',' read -ra _done_ids <<< "$done_csv"
+            for _did in "${_done_ids[@]}"; do
+                _did="${_did#"${_did%%[![:space:]]*}"}"
+                _did="${_did%"${_did##*[![:space:]]}"}"
+                if [ -n "$_did" ]; then
+                    ((++TASK_COUNT_DONE))
+                    ((++TASK_COUNT_TOTAL))
+                    task_ids[$_did]=$line_num
+                fi
+            done
+            continue
+        fi
+
+        # Check for task line: - [ ] **[TASK-ID]** or - [x] **[TASK-ID]** etc.
+        # Status markers: space=pending, x=complete, ==in-progress, P=pending-approval, N=not-planned, *=failed
+        if [[ "$line" =~ ^-[[:space:]]\[([[:space:]x=PN\*])\][[:space:]]\*\*\[([A-Za-z0-9-]+)\]\*\* ]]; then
+            local task_state="${BASH_REMATCH[1]}"
+            local task_id="${BASH_REMATCH[2]}"
+
+            # Track task state
+            ((++TASK_COUNT_TOTAL))
+            case "$task_state" in
+                " ") ((++TASK_COUNT_TODO)) ;;
+                "x") ((++TASK_COUNT_DONE)) ;;
+                "=") ((++TASK_COUNT_IN_PROGRESS)) ;;
+                "P") ((++TASK_COUNT_PENDING_APPROVAL)) ;;
+                "N") ((++TASK_COUNT_NOT_PLANNED)) ;;
+                "*") ((++TASK_COUNT_FAILED)) ;;
+            esac
+
+            # Validate task ID format
+            if [[ ! "$task_id" =~ ^[A-Za-z]{2,10}-[0-9]{1,4}$ ]]; then
+                add_error "$line_num" "Malformed task ID '$task_id' - must match pattern [A-Za-z]{2,10}-[0-9]{1,4} (e.g., TASK-001)"
+            fi
+
+            # Check for duplicate task IDs
+            if [ -n "${task_ids[$task_id]:-}" ]; then
+                add_error "$line_num" "Duplicate task ID '$task_id' (first occurrence at line ${task_ids[$task_id]})"
+            else
+                task_ids[$task_id]=$line_num
+                all_task_ids+=("$task_id")
+            fi
+
+            # If we were processing a previous task, check it had required fields
+            if [ -n "$current_task_id" ]; then
+                if [ "$has_description" = false ]; then
+                    add_error "$current_task_line" "Task '$current_task_id' missing required field: Description"
+                fi
+                if [ "$has_priority" = false ]; then
+                    add_error "$current_task_line" "Task '$current_task_id' missing required field: Priority"
+                fi
+            fi
+
+            # Start tracking new task
+            current_task_id="$task_id"
+            current_task_line=$line_num
+            has_description=false
+            has_priority=false
+            in_scope=false
+            in_oos=false
+            in_ac=false
+            continue
+        fi
+
+        # Check field lines (must be indented with exactly 2 spaces)
+        if [ -n "$current_task_id" ]; then
+            # Check for Description field
+            if [[ "$line" =~ ^[[:space:]]{2}-[[:space:]]Description:[[:space:]]* ]]; then
+                # Validate indentation
+                if [[ ! "$line" =~ ^\ \ - ]]; then
+                    add_error "$line_num" "Incorrect indentation for Description field (expected 2 spaces)"
+                fi
+                has_description=true
+                # Check Description is not empty
+                local desc_value="${line#*Description: }"
+                if [ -z "$desc_value" ] || [ "$desc_value" = "$line" ]; then
+                    add_error "$line_num" "Description field is empty for task '$current_task_id'"
+                fi
+                in_scope=false
+                in_oos=false
+                in_ac=false
+                continue
+            fi
+
+            # Check for Priority field
+            if [[ "$line" =~ ^[[:space:]]{2}-[[:space:]]Priority:[[:space:]]* ]]; then
+                if [[ ! "$line" =~ ^\ \ - ]]; then
+                    add_error "$line_num" "Incorrect indentation for Priority field (expected 2 spaces)"
+                fi
+                has_priority=true
+                # Validate priority value
+                local priority_value="${line#*Priority: }"
+                priority_value="${priority_value%%[[:space:]]*}"  # Trim trailing whitespace
+                if [[ ! "$priority_value" =~ ^(CRITICAL|HIGH|MEDIUM|LOW)$ ]]; then
+                    add_error "$line_num" "Invalid priority '$priority_value' for task '$current_task_id' - must be CRITICAL, HIGH, MEDIUM, or LOW"
+                else
+                    # Track priority counts
+                    case "$priority_value" in
+                        "CRITICAL") ((++PRIORITY_CRITICAL)) ;;
+                        "HIGH") ((++PRIORITY_HIGH)) ;;
+                        "MEDIUM") ((++PRIORITY_MEDIUM)) ;;
+                        "LOW") ((++PRIORITY_LOW)) ;;
+                    esac
+                fi
+                in_scope=false
+                in_oos=false
+                in_ac=false
+                continue
+            fi
+
+            # Check for Dependencies field
+            if [[ "$line" =~ ^[[:space:]]{2}-[[:space:]]Dependencies:[[:space:]]* ]]; then
+                if [[ ! "$line" =~ ^\ \ - ]]; then
+                    add_error "$line_num" "Incorrect indentation for Dependencies field (expected 2 spaces)"
+                fi
+                local deps_value="${line#*Dependencies: }"
+                # Trim trailing whitespace only (not internal spaces)
+                deps_value="${deps_value%"${deps_value##*[![:space:]]}"}"
+
+                # Store dependencies for validation (if not "none")
+                if [ "$deps_value" != "none" ] && [ -n "$deps_value" ]; then
+                    task_dependencies[$current_task_id]="$deps_value:$line_num"
+                fi
+                in_scope=false
+                in_oos=false
+                in_ac=false
+                continue
+            fi
+
+            # Check for Scope, Out of Scope, Acceptance Criteria sections
+            if [[ "$line" =~ ^[[:space:]]{2}-[[:space:]]Scope:?[[:space:]]*$ ]]; then
+                if [[ ! "$line" =~ ^\ \ - ]]; then
+                    add_error "$line_num" "Incorrect indentation for Scope field (expected 2 spaces)"
+                fi
+                in_scope=true
+                in_oos=false
+                in_ac=false
+                continue
+            fi
+
+            if [[ "$line" =~ ^[[:space:]]{2}-[[:space:]]Out\ of\ Scope:?[[:space:]]*$ ]]; then
+                if [[ ! "$line" =~ ^\ \ - ]]; then
+                    add_error "$line_num" "Incorrect indentation for Out of Scope field (expected 2 spaces)"
+                fi
+                in_scope=false
+                in_oos=true
+                in_ac=false
+                continue
+            fi
+
+            if [[ "$line" =~ ^[[:space:]]{2}-[[:space:]]Acceptance\ Criteria:?[[:space:]]*$ ]]; then
+                if [[ ! "$line" =~ ^\ \ - ]]; then
+                    add_error "$line_num" "Incorrect indentation for Acceptance Criteria field (expected 2 spaces)"
+                fi
+                in_scope=false
+                in_oos=false
+                in_ac=true
+                continue
+            fi
+
+            # Check sub-item indentation (4 spaces)
+            if [ "$in_scope" = true ] || [ "$in_oos" = true ] || [ "$in_ac" = true ]; then
+                if [[ "$line" =~ ^[[:space:]]{4}-[[:space:]] ]]; then
+                    if [[ ! "$line" =~ ^\ \ \ \ - ]]; then
+                        add_error "$line_num" "Incorrect indentation for sub-item (expected 4 spaces)"
+                    fi
+                fi
+            fi
+        fi
+    done < "$kanban_file"
+
+    # Check the last task had required fields
+    if [ -n "$current_task_id" ]; then
+        if [ "$has_description" = false ]; then
+            add_error "$current_task_line" "Task '$current_task_id' missing required field: Description"
+        fi
+        if [ "$has_priority" = false ]; then
+            add_error "$current_task_line" "Task '$current_task_id' missing required field: Priority"
+        fi
+    fi
+
+    # Check if TASKS section was found
+    if [ "$in_tasks_section" = false ]; then
+        add_error 1 "Missing required '## TASKS' section header"
+    fi
+
+    # Validate dependency references
+    for task_id in "${!task_dependencies[@]}"; do
+        local deps_info="${task_dependencies[$task_id]}"
+        local deps_str="${deps_info%:*}"
+        local deps_line="${deps_info#*:}"
+
+        # Parse comma-separated dependencies
+        IFS=',' read -ra deps <<< "$deps_str"
+        for dep in "${deps[@]}"; do
+            dep="${dep#"${dep%%[![:space:]]*}"}"  # Trim leading whitespace
+            dep="${dep%"${dep##*[![:space:]]}"}"  # Trim trailing whitespace
+
+            if [ -z "${task_ids[$dep]:-}" ]; then
+                add_error "$deps_line" "Task '$task_id' references non-existent dependency '$dep'"
+            fi
+        done
+    done
+
+    return 0
+}
+
+# Get status sort priority (lower = higher in sorted output)
+# Returns: 1=[x], 2=[*], 3=[P], 4=[ ]/[=], 5=[N]
+get_status_priority() {
+    local status="$1"
+    case "$status" in
+        "x") echo 1 ;;  # Complete - top
+        "*") echo 2 ;;  # Failed
+        "P") echo 3 ;;  # Pending approval
+        " ") echo 4 ;;  # Pending
+        "=") echo 4 ;;  # In-progress (same as pending)
+        "N") echo 5 ;;  # Not planned - bottom
+        *)   echo 4 ;;  # Default to pending
+    esac
+}
+
+# Get section header name for a status priority
+get_section_header() {
+    local priority="$1"
+    case "$priority" in
+        1) echo "### Completed" ;;
+        2) echo "### Failed" ;;
+        3) echo "### Pending Approval" ;;
+        4) echo "### Pending" ;;
+        5) echo "### Not Planned" ;;
+        *) echo "### Other" ;;
+    esac
+}
+
+# Internal implementation - called under lock
+_sort_kanban_impl() {
+    local kanban_file="$1"
+    local quiet="${2:-false}"
+
+    # First validate the file
+    validate_kanban "$kanban_file"
+    if [ "$VALID" = false ]; then
+        echo "Cannot sort: validation failed" >&2
+        return $EXIT_VALIDATE_ERRORS_FOUND
+    fi
+
+    local header=""
+    local footer=""
+    local in_tasks_section=false
+    local past_tasks_section=false
+    local tasks_header=""
+
+    # Arrays to hold task blocks
+    declare -a task_blocks=()
+    declare -a task_sort_keys=()
+    local current_block=""
+
+    # Read file and parse into sections
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Check for TASKS section header
+        if [[ "$line" =~ ^##[[:space:]]+TASKS[[:space:]]*$ ]]; then
+            in_tasks_section=true
+            tasks_header="$line"
+            continue
+        fi
+
+        # Check for next section after TASKS (## something else)
+        if [ "$in_tasks_section" = true ] && [[ "$line" =~ ^##[[:space:]] ]] && [[ ! "$line" =~ ^##[[:space:]]+TASKS ]]; then
+            in_tasks_section=false
+            past_tasks_section=true
+            # Save any pending block
+            if [ -n "$current_block" ]; then
+                task_blocks+=("$current_block")
+                current_block=""
+            fi
+            footer="$line"
+            continue
+        fi
+
+        if [ "$in_tasks_section" = false ] && [ "$past_tasks_section" = false ]; then
+            # Before TASKS section - accumulate header
+            if [ -n "$header" ]; then
+                header="$header"$'\n'"$line"
+            else
+                header="$line"
+            fi
+        elif [ "$past_tasks_section" = true ]; then
+            # After TASKS section - accumulate footer
+            footer="$footer"$'\n'"$line"
+        else
+            # Inside TASKS section
+            # Skip existing section headers (### lines) - we'll add our own
+            if [[ "$line" =~ ^###[[:space:]] ]]; then
+                continue
+            fi
+
+            # Check for task line
+            if [[ "$line" =~ ^-[[:space:]]\[([[:space:]x=PN\*])\][[:space:]]\*\*\[([A-Za-z0-9-]+)\]\*\* ]]; then
+                # Save previous block if exists
+                if [ -n "$current_block" ]; then
+                    task_blocks+=("$current_block")
+                fi
+
+                local status="${BASH_REMATCH[1]}"
+                local task_id="${BASH_REMATCH[2]}"
+                local status_priority
+                status_priority=$(get_status_priority "$status")
+
+                # Create sort key: status_priority|task_id
+                task_sort_keys+=("$status_priority|$task_id")
+                current_block="$line"
+            elif [ -n "$current_block" ]; then
+                # Continuation of current task block (fields, sub-items, blank lines)
+                current_block="$current_block"$'\n'"$line"
+            fi
+            # Ignore lines before first task (blank lines at start of section)
+        fi
+    done < "$kanban_file"
+
+    # Save last block
+    if [ -n "$current_block" ]; then
+        task_blocks+=("$current_block")
+    fi
+
+    # Sort tasks by sort key
+    local num_tasks=${#task_blocks[@]}
+    if [ "$num_tasks" -eq 0 ]; then
+        if [ "$quiet" = false ]; then
+            echo "No tasks to sort"
+        fi
+        return $EXIT_OK
+    fi
+
+    # Create array of indices and sort by sort key
+    local sorted_indices=()
+    for ((i=0; i<num_tasks; i++)); do
+        sorted_indices+=("$i|${task_sort_keys[$i]}")
+    done
+
+    # Sort: by status priority (field 2), then by task-id (field 3)
+    IFS=$'\n' read -r -d '' -a sorted_indices < <(
+        printf '%s\n' "${sorted_indices[@]}" | LC_ALL=C sort -t'|' -k2,2n -k3,3
+        printf '\0'
+    )
+
+    # Write sorted file
+    {
+        # Write header (remove trailing whitespace-only lines)
+        while [[ "$header" =~ $'\n'[[:space:]]*$ ]]; do
+            header="${header%$'\n'*}"
+        done
+        printf '%s\n' "$header"
+        echo ""
+        echo "$tasks_header"
+
+        # Write sorted tasks grouped by status with section headers
+        local current_section=""
+        for entry in "${sorted_indices[@]}"; do
+            local idx="${entry%%|*}"
+            local sort_key="${entry#*|}"
+            local status_priority="${sort_key%%|*}"
+
+            # Check if we need a new section header
+            local section_header
+            section_header=$(get_section_header "$status_priority")
+            if [ "$section_header" != "$current_section" ]; then
+                echo ""
+                echo "$section_header"
+                echo ""
+                current_section="$section_header"
+            fi
+
+            local block="${task_blocks[$idx]}"
+            # Remove trailing whitespace-only lines from block
+            while [[ "$block" =~ $'\n'[[:space:]]*$ ]]; do
+                block="${block%$'\n'*}"
+            done
+            printf '%s\n' "$block"
+            echo ""
+        done
+
+        # Write footer if exists
+        if [ -n "$footer" ]; then
+            # Remove leading whitespace-only lines from footer
+            while [[ "$footer" =~ ^[[:space:]]*$'\n' ]]; do
+                footer="${footer#*$'\n'}"
+            done
+            printf '%s\n' "$footer"
+        fi
+    } > "$kanban_file.tmp"
+
+    # Replace original with sorted version
+    mv "$kanban_file.tmp" "$kanban_file"
+
+    if [ "$quiet" = false ]; then
+        echo "Sorted $num_tasks tasks in $kanban_file"
+    fi
+
+    return $EXIT_OK
+}
+
+# Sort kanban file with file locking to prevent concurrent modification
+sort_kanban() {
+    local kanban_file="$1"
+    local quiet="${2:-false}"
+
+    if [ ! -f "$kanban_file" ]; then
+        echo "Error: Kanban file not found: $kanban_file" >&2
+        return $EXIT_VALIDATE_FILE_NOT_FOUND
+    fi
+
+    # Acquire lock for the entire sort operation to prevent concurrent modifications
+    with_file_lock "$kanban_file" 5 _sort_kanban_impl "$kanban_file" "$quiet"
+}
+
+# Internal implementation - called under lock
+#
+# Collapses completed [x] task blocks into a single summary line at the top
+# of the TASKS section, preserving task IDs so dependency references remain valid.
+# Format: <!-- done: TASK-001, TASK-002, TASK-003 -->
+_cleanup_kanban_impl() {
+    local kanban_file="$1"
+    local quiet="${2:-false}"
+
+    # First validate the file
+    validate_kanban "$kanban_file"
+    if [ "$VALID" = false ]; then
+        echo "Cannot cleanup: validation failed" >&2
+        return $EXIT_VALIDATE_ERRORS_FOUND
+    fi
+
+    local header=""
+    local footer=""
+    local in_tasks_section=false
+    local past_tasks_section=false
+    local tasks_header=""
+
+    # Arrays to hold task blocks
+    declare -a task_blocks=()
+    declare -a task_statuses=()
+    declare -a block_ids=()
+    local current_block=""
+    local current_status=""
+    local current_id=""
+
+    # Collect IDs already in an existing done comment
+    declare -a existing_done_ids=()
+
+    # Read file and parse into sections
+    while IFS= read -r line || [ -n "$line" ]; do
+        # Check for TASKS section header
+        if [[ "$line" =~ ^##[[:space:]]+TASKS[[:space:]]*$ ]]; then
+            in_tasks_section=true
+            tasks_header="$line"
+            continue
+        fi
+
+        # Check for next section after TASKS (## something else)
+        if [ "$in_tasks_section" = true ] && [[ "$line" =~ ^##[[:space:]] ]] && [[ ! "$line" =~ ^##[[:space:]]+TASKS ]]; then
+            in_tasks_section=false
+            past_tasks_section=true
+            # Save any pending block
+            if [ -n "$current_block" ]; then
+                task_blocks+=("$current_block")
+                task_statuses+=("$current_status")
+                block_ids+=("$current_id")
+                current_block=""
+            fi
+            footer="$line"
+            continue
+        fi
+
+        if [ "$in_tasks_section" = false ] && [ "$past_tasks_section" = false ]; then
+            # Before TASKS section - accumulate header
+            if [ -n "$header" ]; then
+                header="$header"$'\n'"$line"
+            else
+                header="$line"
+            fi
+        elif [ "$past_tasks_section" = true ]; then
+            # After TASKS section - accumulate footer
+            footer="$footer"$'\n'"$line"
+        else
+            # Inside TASKS section
+            # Parse existing done comment (skip it — we'll regenerate)
+            if [[ "$line" =~ ^\<!--[[:space:]]*done:[[:space:]]*(.*)[[:space:]]*--\>$ ]]; then
+                local ids_csv="${BASH_REMATCH[1]}"
+                IFS=',' read -ra _ids <<< "$ids_csv"
+                for _id in "${_ids[@]}"; do
+                    _id="${_id#"${_id%%[![:space:]]*}"}"
+                    _id="${_id%"${_id##*[![:space:]]}"}"
+                    [ -n "$_id" ] && existing_done_ids+=("$_id")
+                done
+                continue
+            fi
+
+            # Check for task line
+            if [[ "$line" =~ ^-[[:space:]]\[([[:space:]x=PN\*])\][[:space:]]\*\*\[([A-Za-z0-9-]+)\]\*\* ]]; then
+                # Save previous block if exists
+                if [ -n "$current_block" ]; then
+                    task_blocks+=("$current_block")
+                    task_statuses+=("$current_status")
+                    block_ids+=("$current_id")
+                fi
+
+                current_status="${BASH_REMATCH[1]}"
+                current_id="${BASH_REMATCH[2]}"
+                current_block="$line"
+            elif [ -n "$current_block" ]; then
+                # Continuation of current task block
+                current_block="$current_block"$'\n'"$line"
+            fi
+        fi
+    done < "$kanban_file"
+
+    # Save last block
+    if [ -n "$current_block" ]; then
+        task_blocks+=("$current_block")
+        task_statuses+=("$current_status")
+        block_ids+=("$current_id")
+    fi
+
+    # Separate completed from non-completed task blocks
+    local num_tasks=${#task_blocks[@]}
+    declare -a collapsed_ids=()
+    declare -a kept_blocks=()
+
+    for ((i=0; i<num_tasks; i++)); do
+        if [ "${task_statuses[$i]}" = "x" ]; then
+            collapsed_ids+=("${block_ids[$i]}")
+        else
+            kept_blocks+=("${task_blocks[$i]}")
+        fi
+    done
+
+    local num_collapsed=${#collapsed_ids[@]}
+
+    if [ "$num_collapsed" -eq 0 ] && [ ${#existing_done_ids[@]} -eq 0 ]; then
+        if [ "$quiet" = false ]; then
+            echo "No completed tasks to clean up"
+        fi
+        return $EXIT_OK
+    fi
+
+    # Merge existing done IDs with newly collapsed ones (preserve order, deduplicate)
+    declare -A seen_ids=()
+    declare -a all_done_ids=()
+    for _id in "${existing_done_ids[@]}" "${collapsed_ids[@]}"; do
+        if [ -z "${seen_ids[$_id]:-}" ]; then
+            seen_ids[$_id]=1
+            all_done_ids+=("$_id")
+        fi
+    done
+
+    # Build done comment line
+    local done_csv=""
+    for _id in "${all_done_ids[@]}"; do
+        if [ -n "$done_csv" ]; then
+            done_csv="$done_csv, $_id"
+        else
+            done_csv="$_id"
+        fi
+    done
+    local done_line="<!-- done: $done_csv -->"
+
+    # Write cleaned file
+    {
+        # Write header (remove trailing whitespace-only lines)
+        while [[ "$header" =~ $'\n'[[:space:]]*$ ]]; do
+            header="${header%$'\n'*}"
+        done
+        printf '%s\n' "$header"
+        echo ""
+        echo "$tasks_header"
+        echo ""
+        echo "$done_line"
+        echo ""
+
+        # Write kept tasks
+        for block in "${kept_blocks[@]}"; do
+            # Remove trailing whitespace-only lines from block
+            while [[ "$block" =~ $'\n'[[:space:]]*$ ]]; do
+                block="${block%$'\n'*}"
+            done
+            printf '%s\n' "$block"
+            echo ""
+        done
+
+        # Write footer if exists
+        if [ -n "$footer" ]; then
+            # Remove leading whitespace-only lines from footer
+            while [[ "$footer" =~ ^[[:space:]]*$'\n' ]]; do
+                footer="${footer#*$'\n'}"
+            done
+            printf '%s\n' "$footer"
+        fi
+    } > "$kanban_file.tmp"
+
+    # Replace original with cleaned version
+    mv "$kanban_file.tmp" "$kanban_file"
+
+    if [ "$quiet" = false ]; then
+        if [ "$num_collapsed" -gt 0 ]; then
+            local ids_str=""
+            for _id in "${collapsed_ids[@]}"; do
+                if [ -n "$ids_str" ]; then
+                    ids_str="$ids_str, $_id"
+                else
+                    ids_str="$_id"
+                fi
+            done
+            echo "Collapsed $num_collapsed completed task(s): $ids_str"
+        else
+            echo "No new completed tasks to collapse"
+        fi
+    fi
+
+    return $EXIT_OK
+}
+
+# Collapse completed tasks in kanban file with file locking
+cleanup_kanban() {
+    local kanban_file="$1"
+    local quiet="${2:-false}"
+
+    if [ ! -f "$kanban_file" ]; then
+        echo "Error: Kanban file not found: $kanban_file" >&2
+        return $EXIT_VALIDATE_FILE_NOT_FOUND
+    fi
+
+    # Acquire lock for the entire cleanup operation
+    with_file_lock "$kanban_file" 5 _cleanup_kanban_impl "$kanban_file" "$quiet"
+}
+
+main() {
+    # Parse verbose flags first
+    WIGGUM_REMAINING_ARGS=(); parse_verbose_flags "$@"
+    set -- ${WIGGUM_REMAINING_ARGS[@]:+"${WIGGUM_REMAINING_ARGS[@]}"}
+
+    local kanban_file="$RALPH_DIR/kanban.md"
+    local quiet=false
+    local do_sort=false
+    local do_cleanup=false
+
+    # Map LOG_LEVEL=WARN to quiet for backward compatibility
+    if [[ "${LOG_LEVEL:-}" == "WARN" ]]; then
+        quiet=true
+    fi
+
+    # Check for subcommand first
+    if [[ "${1:-}" == "sort" ]]; then
+        do_sort=true
+        shift
+    elif [[ "${1:-}" == "cleanup" ]]; then
+        do_cleanup=true
+        shift
+    fi
+
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--file)
+                if [[ -z "${2:-}" ]] || [[ "${2:-}" =~ ^- ]]; then
+                    echo "Error: --file requires a path argument"
+                    exit $EXIT_USAGE
+                fi
+                kanban_file="$2"
+                shift 2
+                ;;
+            -h|--help)
+                show_help
+                exit $EXIT_OK
+                ;;
+            -*)
+                echo "Unknown option: $1"
+                echo ""
+                show_help
+                exit $EXIT_USAGE
+                ;;
+            *)
+                echo "Unknown argument: $1"
+                echo ""
+                show_help
+                exit $EXIT_USAGE
+                ;;
+        esac
+    done
+
+    # Handle sort subcommand
+    if [ "$do_sort" = true ]; then
+        sort_kanban "$kanban_file" "$quiet"
+        exit $?
+    fi
+
+    # Handle cleanup subcommand
+    if [ "$do_cleanup" = true ]; then
+        cleanup_kanban "$kanban_file" "$quiet"
+        exit $?
+    fi
+
+    # Run validation only
+    validate_kanban "$kanban_file"
+    local validate_result=$?
+
+    if [ $validate_result -eq $EXIT_VALIDATE_FILE_NOT_FOUND ]; then
+        exit $EXIT_VALIDATE_FILE_NOT_FOUND
+    fi
+
+    # Show summary unless quiet mode
+    if [ "$quiet" = false ]; then
+        show_summary
+    fi
+
+    # Report results
+    if [ "$VALID" = false ]; then
+        echo "Validation failed with ${#VALIDATION_ERRORS[@]} error(s):"
+        echo ""
+        for error in ${VALIDATION_ERRORS[@]:+"${VALIDATION_ERRORS[@]}"}; do
+            echo "  ERROR: $error"
+        done
+        exit $EXIT_VALIDATE_ERRORS_FOUND
+    else
+        if [ "$quiet" = false ]; then
+            echo "Validation passed: $kanban_file is valid"
+        fi
+        exit $EXIT_OK
+    fi
+}
+
+main "$@"

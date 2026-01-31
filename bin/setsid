@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: setsid <command> [args...]")
+        sys.exit(1)
+
+    try:
+        # Create a new session
+        os.setsid()
+    except OSError:
+        # Already a session leader or other error
+        pass
+
+    # Execute the command
+    try:
+        os.execvp(sys.argv[1], sys.argv[1:])
+    except FileNotFoundError:
+        print(f"setsid: {sys.argv[1]}: command not found")
+        sys.exit(127)
+    except Exception as e:
+        print(f"setsid: {e}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,167 @@
+#!/opt/homebrew/bin/bash
+# Chief Wiggum - Worker launcher and manager
+set -euo pipefail
+
+WIGGUM_HOME="${WIGGUM_HOME:-$HOME/.claude/chief-wiggum}"
+
+source "$WIGGUM_HOME/lib/core/exit-codes.sh"
+source "$WIGGUM_HOME/lib/core/verbose-flags.sh"
+
+show_help() {
+    cat << EOF
+Chief Wiggum - Autonomous Worker Orchestration
+
+Usage: wiggum [flags] <command> [options]
+
+Commands:
+  init                Initialize .ralph/ directory in current project
+  validate            Validate kanban.md format and structure
+  run                 Orchestrate workers for incomplete tasks
+  status              Show status of workers and tasks
+  monitor             Monitor worker logs in real-time
+  doctor              Check environment setup and dependencies
+
+Worker Management:
+  stop [<id>]         Stop worker(s) gracefully (SIGTERM)
+  stop orchestrator   Stop the orchestrator process
+  kill [<id>]         Force kill worker(s) (SIGKILL)
+  start <TASK-ID>     Manually start a worker for a task
+  resume <id> [-f]    Resume a previously stopped worker
+
+Planning:
+  plan <TASK-ID>      Create implementation plan for a task (read-only)
+
+Cleanup & Review:
+  clean <target>      Clean up worktrees and worker directories
+  review              Review and manage worker Pull Requests
+
+Utilities:
+  util convert-log    Convert JSONL iteration logs to markdown
+  service             Manage orchestrator services (list, status, run, stop)
+  gh                  Sync GitHub issues with local kanban
+
+Run Options:
+  --max-workers N     Maximum concurrent workers (default: 4)
+
+Global Flags:
+  -v, --verbose       Verbose output (same as default)
+  -vv                 Debug output (detailed diagnostics)
+  -vvv                Trace output (very detailed tracing)
+  -q, --quiet         Quiet mode (warnings and errors only)
+
+Examples:
+  wiggum init                   # Initialize project
+  wiggum validate               # Validate kanban.md before running
+  wiggum run                    # Start orchestration (max 4 workers)
+  wiggum run --max-workers 8    # Start with max 8 workers
+  wiggum status                 # Show worker status
+  wiggum monitor                # Monitor worker output
+
+  wiggum stop                   # Stop all workers
+  wiggum stop TASK-030          # Stop specific worker
+  wiggum stop orchestrator      # Stop the orchestrator
+  wiggum kill TASK-030          # Force kill specific worker
+  wiggum start TASK-040         # Manually start worker for task
+  wiggum resume TASK-030        # Resume stopped worker
+  wiggum resume TASK-030 -f     # Force resume after fixing violations
+
+  wiggum clean TASK-030         # Clean up specific worker
+  wiggum clean all              # Clean up all workers
+  wiggum review list            # List open PRs
+
+  wiggum util convert-log TASK-030   # Convert iteration logs to markdown
+
+Behavior:
+  - Wiggum assigns pending tasks [ ] to workers
+  - Tasks are marked in-progress [=] when assigned
+  - Workers mark tasks complete [x] when done
+  - Wiggum waits until all tasks are complete
+  - New workers spawn as old ones finish (up to max)
+
+For more help on specific commands:
+  wiggum <command> --help
+
+EOF
+}
+
+main() {
+    # Parse verbose flags first (before command)
+    # This sets LOG_LEVEL and removes verbose flags from args
+    parse_verbose_flags "$@"
+    set -- ${WIGGUM_REMAINING_ARGS[@]:+"${WIGGUM_REMAINING_ARGS[@]}"}
+
+    # Require a command
+    if [ $# -eq 0 ]; then
+        echo "Error: No command specified"
+        echo ""
+        show_help
+        exit $EXIT_USAGE
+    fi
+
+    # Parse command
+    local command="$1"
+    shift
+
+    case "$command" in
+        init)
+            exec "$WIGGUM_HOME/bin/wiggum-init" "$@"
+            ;;
+        validate)
+            exec "$WIGGUM_HOME/bin/wiggum-validate" "$@"
+            ;;
+        run)
+            exec "$WIGGUM_HOME/bin/wiggum-run" "$@"
+            ;;
+        stop)
+            exec "$WIGGUM_HOME/bin/wiggum-stop" "$@"
+            ;;
+        kill)
+            exec "$WIGGUM_HOME/bin/wiggum-kill" "$@"
+            ;;
+        start)
+            exec "$WIGGUM_HOME/bin/wiggum-start" "$@"
+            ;;
+        plan)
+            exec "$WIGGUM_HOME/bin/wiggum-plan" "$@"
+            ;;
+        resume)
+            exec "$WIGGUM_HOME/bin/wiggum-resume" "$@"
+            ;;
+        clean)
+            exec "$WIGGUM_HOME/bin/wiggum-clean" "$@"
+            ;;
+        status)
+            exec "$WIGGUM_HOME/bin/wiggum-status" "$@"
+            ;;
+        monitor)
+            exec "$WIGGUM_HOME/bin/wiggum-monitor" "$@"
+            ;;
+        review)
+            exec "$WIGGUM_HOME/bin/wiggum-review" "$@"
+            ;;
+        doctor)
+            exec "$WIGGUM_HOME/bin/wiggum-doctor" "$@"
+            ;;
+        util)
+            exec "$WIGGUM_HOME/bin/wiggum-util" "$@"
+            ;;
+        service)
+            exec "$WIGGUM_HOME/bin/wiggum-service" "$@"
+            ;;
+        gh)
+            exec "$WIGGUM_HOME/bin/wiggum-gh" "$@"
+            ;;
+        -h|--help|help)
+            show_help
+            exit $EXIT_OK
+            ;;
+        *)
+            echo "Unknown command: $command"
+            echo ""
+            show_help
+            exit $EXIT_USAGE
+            ;;
+    esac
+}
+
+main "$@"

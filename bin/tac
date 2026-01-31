@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# tac fallback for macOS
+if [ $# -eq 0 ]; then
+    tail -r
+else
+    tail -r "$@"
+fi

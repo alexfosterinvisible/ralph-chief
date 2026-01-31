@@ -1,0 +1,1 @@
+"""Widgets for wiggum TUI."""

@@ -1,0 +1,24 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|Bash|Read|Glob|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${WIGGUM_HOME}/hooks/callbacks/validate-workspace-path.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${WIGGUM_HOME}/hooks/callbacks/inject-workspace-boundary.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

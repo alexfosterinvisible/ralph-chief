@@ -1,0 +1,52 @@
+{
+  "summary": {
+    "total_workers": 2,
+    "successful_workers": 1,
+    "failed_workers": 1,
+    "success_rate": 50.0,
+    "total_time": "00:30:00",
+    "total_time_seconds": 1800,
+    "total_cost": 0.75
+  },
+  "tokens": {
+    "input": 50000,
+    "output": 15000,
+    "cache_creation": 3000,
+    "cache_read": 25000,
+    "total": 93000
+  },
+  "cost_breakdown": {
+    "input": 0.50,
+    "output": 0.15,
+    "cache_creation": 0.05,
+    "cache_read": 0.05,
+    "total": 0.75
+  },
+  "context": {
+    "tokens": 12000,
+    "size": 200000,
+    "percent": 6.0
+  },
+  "workers": [
+    {
+      "worker_id": "worker-TEST-001-1700000000",
+      "status": "success",
+      "time_spent": "00:15:00",
+      "time_seconds": 900,
+      "tokens": {
+        "input": 25000,
+        "output": 7500,
+        "cache_creation": 1500,
+        "cache_read": 12500,
+        "total": 46500
+      },
+      "cost": 0.40,
+      "pr_url": "https://github.com/example/repo/pull/42",
+      "context": {
+        "tokens": 6000,
+        "size": 200000,
+        "percent": 3.0
+      }
+    }
+  ]
+}

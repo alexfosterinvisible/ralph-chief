@@ -1,0 +1,1118 @@
+#!/opt/homebrew/bin/bash
+# Review and manage worker PRs using gh CLI
+set -euo pipefail
+
+WIGGUM_HOME="${WIGGUM_HOME:-$HOME/.claude/chief-wiggum}"
+PROJECT_DIR="$(pwd)"
+RALPH_DIR="${RALPH_DIR:-$PROJECT_DIR/.ralph}"
+
+source "$WIGGUM_HOME/lib/core/exit-codes.sh"
+source "$WIGGUM_HOME/lib/core/defaults.sh"
+source "$WIGGUM_HOME/lib/core/verbose-flags.sh"
+source "$WIGGUM_HOME/lib/core/logger.sh"
+source "$WIGGUM_HOME/lib/core/file-lock.sh"
+source "$WIGGUM_HOME/lib/tasks/task-parser.sh"
+source "$WIGGUM_HOME/lib/git/pr-comments.sh"
+source "$WIGGUM_HOME/lib/git/git-operations.sh"
+source "$WIGGUM_HOME/lib/worker/agent-registry.sh"
+source "$WIGGUM_HOME/lib/worker/git-state.sh"
+source "$WIGGUM_HOME/lib/runtime/runtime.sh"
+source "$WIGGUM_HOME/lib/backend/claude/usage-tracker.sh"
+
+# Recompute usage at startup (ensures rate limit checks use fresh data)
+if [ -d "$RALPH_DIR" ]; then
+    usage_tracker_write_shared "$RALPH_DIR" > /dev/null 2>&1 || true
+fi
+
+show_help() {
+    cat << EOF
+wiggum review - Review and manage worker Pull Requests
+
+Usage: wiggum review [command] [options]
+
+Commands:
+  list                      List all open worker PRs
+  sync                      Global sync: update merged PRs to [x], detect new comments
+  pr [PR#] view             View a specific PR with diff
+  pr [PR#] merge            Merge a specific PR
+  merge-all                 Merge all worker PRs (with confirmation)
+  cleanup                   Delete merged branches
+  status                    Show integration status
+  task <patterns> sync      Sync PR comments for tasks matching patterns
+  task <patterns> fix       Full fix workflow: fix -> test -> push -> merge (default)
+  task <patterns> fix --quick  Quick fix without test verification (use with caution)
+  task <pattern> resolve    Sync with main and resolve merge conflicts
+  task <pattern> commit     Create commit in worker workspace
+  task <pattern> push       Push worker branch to remote
+  task <pattern> pr         Create PR for worker branch
+  task <pattern> reset      Reset failed worker state for retry
+
+Options:
+  -v, --verbose     Verbose output (same as default)
+  -vv               Debug output (detailed diagnostics)
+  -vvv              Trace output (very detailed tracing)
+  -q, --quiet       Quiet mode (warnings and errors only)
+  --auto-merge      Auto-merge without confirmation (use with caution)
+  --squash          Squash commits when merging
+  --rebase          Rebase instead of merge
+  --no-fetch        Skip fetch/merge from main (for resolve command)
+  -h, --help        Show this help message
+
+Task Pattern Examples:
+  TASK-030                  Single task
+  TASK-030,TASK-031         Multiple tasks (comma-separated)
+
+Environment Variables:
+  WIGGUM_APPROVED_USER_IDS          Comma-separated list of numeric GitHub user IDs to include
+                                    (default: empty)
+  WIGGUM_COMMENT_FIX_MAX_ITERATIONS Maximum fix loop iterations (default: 10)
+  WIGGUM_COMMENT_FIX_MAX_TURNS      Max turns per fix session (default: 30)
+  WIGGUM_AUTO_COMMIT_AFTER_FIX      Auto commit/push after fix (default: true)
+
+Examples:
+  wiggum review list                    # List all worker PRs
+  wiggum review sync                    # Sync all PRs: update merged, detect new comments
+  wiggum review pr 42 view              # Review PR #42
+  wiggum review pr 42 merge             # Merge PR #42
+  wiggum review pr 42 merge --squash    # Squash-merge PR #42
+  wiggum review merge-all               # Merge all worker PRs (with confirmation)
+  wiggum review merge-all --auto-merge  # Auto-merge all without asking
+  wiggum review cleanup                 # Delete merged branches
+  wiggum review task TASK-030 sync      # Sync comments for TASK-030
+  wiggum review task TASK-030,TASK-031 sync  # Sync multiple tasks
+  wiggum review task TASK-030 fix       # Fix comments with test verification (default)
+  wiggum review task TASK-030 fix --quick  # Fix comments without tests (faster)
+  wiggum review task TASK-030 resolve   # Sync main & resolve conflicts
+  wiggum review task TASK-030 resolve --no-fetch  # Resolve without syncing
+  wiggum review task TASK-030 commit    # Create commit for task
+  wiggum review task TASK-030 push      # Push branch to remote
+  wiggum review task TASK-030 pr        # Create PR (pushes first if needed)
+  wiggum review task TASK-030 reset     # Reset failed worker for retry
+
+EOF
+}
+
+log() {
+    echo "[$(date -Iseconds)] $*"
+}
+
+error() {
+    echo "[$(date -Iseconds)] ERROR: $*" >&2
+}
+
+# Check if gh CLI is installed
+if ! command -v gh &> /dev/null; then
+    error "gh CLI is not installed. Install it from: https://cli.github.com/"
+    exit $EXIT_ERROR
+fi
+
+# Check if we're in a git repository
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+    error "Not in a git repository"
+    exit $EXIT_REVIEW_NO_RALPH_DIR
+fi
+
+list_worker_prs() {
+    log "Listing worker Pull Requests..."
+    gh pr list --label "chief-wiggum" --state open 2>/dev/null || \
+    gh pr list --search "Chief Wiggum in:title" --state open 2>/dev/null || \
+    gh pr list --search "task/ in:head" --state open
+}
+
+review_pr() {
+    local pr_number="$1"
+
+    if [ -z "$pr_number" ]; then
+        error "PR number required"
+        return 1
+    fi
+
+    log "Reviewing PR #$pr_number..."
+    echo ""
+    gh pr view "$pr_number"
+    echo ""
+    echo "=== DIFF ==="
+    gh pr diff "$pr_number"
+}
+
+merge_pr() {
+    local pr_number="$1"
+    local merge_method="${2:-merge}"  # merge, squash, or rebase
+
+    if [ -z "$pr_number" ]; then
+        error "PR number required"
+        return 1
+    fi
+
+    log "Merging PR #$pr_number using $merge_method..."
+
+    local merge_flag=""
+    case "$merge_method" in
+        squash)
+            merge_flag="--squash"
+            ;;
+        rebase)
+            merge_flag="--rebase"
+            ;;
+        merge)
+            merge_flag="--merge"
+            ;;
+    esac
+
+    # Don't use --delete-branch: worktrees conflict with local branch deletion
+    # Use 'wiggum review cleanup' to delete merged branches
+    if gh pr merge "$pr_number" $merge_flag; then
+        log "✓ Merged PR #$pr_number"
+        return 0
+    else
+        error "Failed to merge PR #$pr_number"
+        return 1
+    fi
+}
+
+merge_all_prs() {
+    local auto_merge="$1"
+    local merge_method="$2"
+
+    log "Finding all worker PRs..."
+
+    # Get list of PR numbers
+    local pr_numbers
+    pr_numbers=$(gh pr list --search "task/ in:head" --state open --json number -q '.[].number')
+
+    if [ -z "$pr_numbers" ]; then
+        log "No worker PRs found to merge"
+        return 0
+    fi
+
+    local pr_count
+    pr_count=$(echo "$pr_numbers" | wc -l)
+    log "Found $pr_count worker PR(s) to merge"
+
+    echo ""
+    gh pr list --search "task/ in:head" --state open
+    echo ""
+
+    if [ "$auto_merge" != "true" ]; then
+        read -p "Merge all $pr_count PR(s)? [y/N] " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            log "Cancelled"
+            return 0
+        fi
+    fi
+
+    local merged=0
+    local failed=0
+
+    for pr in $pr_numbers; do
+        if merge_pr "$pr" "$merge_method"; then
+            ((++merged))
+        else
+            ((++failed))
+        fi
+    done
+
+    log "Merge complete: $merged successful, $failed failed"
+
+    if [ $merged -gt 0 ]; then
+        log "Pulling changes to local main branch..."
+        git checkout main
+        git pull
+    fi
+}
+
+cleanup_branches() {
+    log "Cleaning up merged branches..."
+
+    # Find branches that match task/* pattern and are merged
+    local merged_branches
+    merged_branches=$(git branch -r --merged main | grep 'origin/task/' | sed 's/origin\///')
+
+    if [ -z "$merged_branches" ]; then
+        log "No merged task branches to clean up"
+        return 0
+    fi
+
+    log "Found merged branches:"
+    echo "$merged_branches"
+    echo ""
+
+    read -p "Delete these branches from remote? [y/N] " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        log "Cancelled"
+        return 0
+    fi
+
+    for branch in $merged_branches; do
+        log "Deleting remote branch: $branch"
+        git push origin --delete "$branch" || true
+    done
+
+    log "✓ Cleanup complete"
+}
+
+show_status() {
+    log "Chief Wiggum Review Status"
+    echo ""
+
+    echo "=== Open Worker PRs ==="
+    gh pr list --search "task/ in:head" --state open || echo "No open PRs"
+    echo ""
+
+    echo "=== Recently Merged Worker PRs ==="
+    gh pr list --search "task/ in:head" --state merged --limit 5 || echo "No merged PRs"
+    echo ""
+
+    echo "=== Local Branch Status ==="
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD)
+    echo "Current branch: $current_branch"
+
+    if [ "$current_branch" = "main" ]; then
+        git status -sb
+    else
+        echo "Not on main branch. Switch to main and pull to integrate changes."
+    fi
+}
+
+# Global sync: update merged PRs to [x], detect new comments for open PRs
+cmd_global_sync() {
+    if [ ! -d "$RALPH_DIR" ]; then
+        error ".ralph/ directory not found"
+        return 1
+    fi
+
+    local kanban="$RALPH_DIR/kanban.md"
+    if [ ! -f "$kanban" ]; then
+        error ".ralph/kanban.md not found"
+        return 1
+    fi
+
+    local sync_state_file="$RALPH_DIR/orchestrator/sync-state.json"
+    local tasks_needing_fix="$RALPH_DIR/orchestrator/tasks-needing-fix.txt"
+
+    # Initialize sync state file if it doesn't exist
+    if [ ! -f "$sync_state_file" ]; then
+        echo "{}" > "$sync_state_file"
+    fi
+
+    # Clear tasks needing fix list
+    : > "$tasks_needing_fix"
+
+    # Get all task/* PRs (both open and merged)
+    log "Syncing PRs..."
+    local all_prs
+    all_prs=$(gh pr list --search "head:task/" --state all --json number,headRefName,state,mergedAt 2>/dev/null || echo "[]")
+
+    local pr_count
+    pr_count=$(echo "$all_prs" | jq 'length')
+    log_debug "Found $pr_count task PR(s)"
+
+    local merged_count=0
+    local comments_count=0
+
+    # Process each PR
+    while read -r pr; do
+        local pr_number branch state
+        pr_number=$(echo "$pr" | jq -r '.number')
+        branch=$(echo "$pr" | jq -r '.headRefName')
+        state=$(echo "$pr" | jq -r '.state')
+
+        # Extract task ID from branch name (task/TASK-001-description -> TASK-001)
+        local task_id
+        task_id=$(echo "$branch" | sed -E 's|^task/([A-Za-z]{2,10}-[0-9]{1,4}).*|\1|')
+
+        if [ -z "$task_id" ] || [ "$task_id" = "$branch" ]; then
+            continue
+        fi
+
+        # Handle merged PRs: update [P] -> [x]
+        if [ "$state" = "MERGED" ]; then
+            local current_status
+            current_status=$(get_task_status "$kanban" "$task_id")
+
+            if [ "$current_status" = "P" ]; then
+                log "  $task_id: merged"
+                update_kanban_status "$kanban" "$task_id" "x"
+                ((++merged_count))
+            fi
+        fi
+
+        # Handle open PRs: check for new comments
+        if [ "$state" = "OPEN" ]; then
+            if _check_for_new_comments "$pr_number" "$sync_state_file"; then
+                log_debug "  PR #$pr_number ($task_id): New comments detected"
+
+                # Find worker directory and sync comments
+                local worker_dir output_dir
+                worker_dir=$(find_worker_by_task_id "$RALPH_DIR" "$task_id" 2>/dev/null)
+
+                if [ -n "$worker_dir" ] && [ -d "$worker_dir" ]; then
+                    output_dir="$worker_dir"
+                    sync_pr_comments "$task_id" "$output_dir"
+
+                    # Only mark as needing fix if there are actually relevant comments from approved authors
+                    local relevant_comment_count=0
+                    if [ -f "$output_dir/task-comments.md" ]; then
+                        relevant_comment_count=$(grep -c '^### ' "$output_dir/task-comments.md" 2>/dev/null) || relevant_comment_count=0
+                    fi
+
+                    if [ "$relevant_comment_count" -gt 0 ]; then
+                        echo "$task_id" >> "$tasks_needing_fix"
+                        git_state_set "$worker_dir" "needs_fix" "wiggum-review.sync" "New PR comments detected ($relevant_comment_count relevant)"
+                        ((++comments_count))
+                    else
+                        log_debug "  $task_id: no relevant comments"
+                    fi
+                else
+                    # No worker - record for later workspace creation
+                    local orphan_file="$RALPH_DIR/orchestrator/prs-needing-workspace.jsonl"
+                    # Save comments to review directory for reference
+                    output_dir="$RALPH_DIR/review"
+                    mkdir -p "$output_dir"
+                    sync_pr_comments "$task_id" "$output_dir"
+
+                    # Only queue for workspace creation if there are relevant comments
+                    local relevant_comment_count=0
+                    if [ -f "$output_dir/task-comments.md" ]; then
+                        relevant_comment_count=$(grep -c '^### ' "$output_dir/task-comments.md" 2>/dev/null) || relevant_comment_count=0
+                    fi
+
+                    if [ "$relevant_comment_count" -gt 0 ]; then
+                        # Record PR info for workspace creation (JSONL format, one per line)
+                        # Skip if already recorded
+                        if ! grep -q "\"task_id\":\"$task_id\"" "$orphan_file" 2>/dev/null; then
+                            echo "{\"task_id\":\"$task_id\",\"pr_number\":$pr_number,\"branch\":\"$branch\"}" >> "$orphan_file"
+                            log "  $task_id: queued (no worker)"
+                        fi
+                        ((++comments_count))
+                    else
+                        log_debug "  $task_id: no relevant comments"
+                    fi
+                fi
+            else
+                log_debug "  $task_id: unchanged"
+            fi
+        fi
+    done < <(echo "$all_prs" | jq -c '.[]')
+
+    # Compact summary
+    if [ "$merged_count" -gt 0 ] || [ "$comments_count" -gt 0 ]; then
+        log "Sync: $merged_count merged, $comments_count with comments"
+    fi
+
+    if [ -s "$tasks_needing_fix" ]; then
+        log "Need fix: $(paste -sd',' "$tasks_needing_fix")"
+    fi
+}
+
+# Sync PR comments for task patterns
+cmd_task_sync() {
+    local patterns="$1"
+
+    if [ -z "$patterns" ]; then
+        error "Task pattern(s) required"
+        echo "Usage: wiggum review task <patterns> sync"
+        return 1
+    fi
+
+    # Determine output directory
+    # Use the worker directory if one exists for the pattern, else use .ralph/review/
+    local output_dir="$RALPH_DIR/review"
+
+    # Try to find existing worker for primary pattern
+    local primary_pattern
+    primary_pattern=$(echo "$patterns" | cut -d',' -f1)
+    local worker_dir
+    worker_dir=$(find_worker_by_task_id "$RALPH_DIR" "$primary_pattern" 2>/dev/null)
+
+    if [ -n "$worker_dir" ] && [ -d "$worker_dir" ]; then
+        output_dir="$worker_dir"
+        log_debug "Using worker: $output_dir"
+    else
+        mkdir -p "$output_dir"
+        log_debug "Using review: $output_dir"
+    fi
+
+    # Check if any matching PRs are merged — if so, mark task as done
+    local kanban="$RALPH_DIR/kanban.md"
+    if [ -f "$kanban" ]; then
+        local prs
+        prs=$(find_prs_by_task_patterns "$patterns")
+
+        echo "$prs" | jq -c '.[] | select(.state == "MERGED")' | while read -r pr; do
+            local branch task_id
+            branch=$(echo "$pr" | jq -r '.headRefName')
+            task_id=$(echo "$branch" | sed -E 's|^task/([A-Za-z]{2,10}-[0-9]{1,4}).*|\1|')
+
+            if [ -n "$task_id" ] && [ "$task_id" != "$branch" ]; then
+                local current_status
+                current_status=$(get_task_status "$kanban" "$task_id")
+
+                if [ "$current_status" != "x" ]; then
+                    local pr_number
+                    pr_number=$(echo "$pr" | jq -r '.number')
+                    log "PR #$pr_number ($task_id): Merged - updating [$current_status] -> [x]"
+                    update_kanban_status "$kanban" "$task_id" "x"
+                fi
+            fi
+        done
+    fi
+
+    sync_pr_comments "$patterns" "$output_dir"
+}
+
+# Fix PR comments for a task (async launch)
+# Uses fix pipeline by default (with test verification)
+# Pass --quick to skip test verification (use with caution)
+cmd_task_fix() {
+    local pattern="$1"
+    local quick_mode="${2:-false}"
+
+    if [ -z "$pattern" ]; then
+        error "Task pattern required"
+        echo "Usage: wiggum review task <pattern> fix [--quick]"
+        return 1
+    fi
+
+    # Find worker directory for this task
+    local worker_dir
+    worker_dir=$(find_worker_by_task_id "$RALPH_DIR" "$pattern")
+
+    if [ -z "$worker_dir" ] || [ ! -d "$worker_dir" ]; then
+        # Try the review directory as fallback
+        worker_dir="$RALPH_DIR/review"
+        if [ ! -f "$worker_dir/task-comments.md" ]; then
+            error "No worker or review directory found for pattern: $pattern"
+            echo "Ensure a worker exists for this task or run sync first:"
+            echo "  wiggum review task $pattern sync"
+            return 1
+        fi
+        log "Using review directory: $worker_dir"
+    fi
+
+    # Verify comments file exists
+    if [ ! -f "$worker_dir/task-comments.md" ]; then
+        error "No comments file found. Run sync first:"
+        echo "  wiggum review task $pattern sync"
+        return 1
+    fi
+
+    # Guard: check if agent is already running
+    if [ -f "$worker_dir/agent.pid" ]; then
+        local existing_pid
+        existing_pid=$(cat "$worker_dir/agent.pid")
+        if kill -0 "$existing_pid" 2>/dev/null; then
+            log "Fix agent already running for $(basename "$worker_dir") (PID: $existing_pid)"
+            return 0
+        fi
+        # Stale PID file - remove it
+        rm -f "$worker_dir/agent.pid"
+    fi
+
+    # Ensure log directory exists
+    mkdir -p "$RALPH_DIR/logs"
+
+    # Determine which agent/pipeline to use
+    # Default: use full fix pipeline with test verification
+    # --quick: use standalone agent without tests (faster but risky)
+    local agent_type="system.task-worker"
+    local pipeline_export='export WIGGUM_PIPELINE="fix"'
+    if [ "$quick_mode" = "true" ]; then
+        agent_type="engineering.pr-comment-fix"
+        pipeline_export=""
+        log "Launching quick fix agent for $(basename "$worker_dir") (no test verification)"
+    else
+        log "Launching fix pipeline for $(basename "$worker_dir") (with test verification)"
+    fi
+
+    # Launch agent in background via setsid (new session, won't receive parent signals)
+    # shellcheck disable=SC2016
+    setsid bash -c '
+        set -euo pipefail
+        _log_ts() { echo "[$(date -Iseconds)] $*"; }
+        _log_ts "INFO: Fix agent subprocess starting"
+        _log_ts "INFO: WIGGUM_HOME='"$WIGGUM_HOME"'"
+        _log_ts "INFO: worker_dir='"$worker_dir"'"
+
+        export WIGGUM_HOME="'"$WIGGUM_HOME"'"
+        '"$pipeline_export"'
+
+        if ! source "$WIGGUM_HOME/lib/worker/agent-registry.sh" 2>&1; then
+            _log_ts "ERROR: Failed to source agent-registry.sh"
+            exit 1
+        fi
+
+        _log_ts "INFO: Running agent '"$agent_type"'"
+        _exit_code=0
+        run_agent "'"$agent_type"'" "'"$worker_dir"'" "'"$PROJECT_DIR"'" || _exit_code=$?
+        if [ $_exit_code -ne 0 ]; then
+            _log_ts "ERROR: run_agent failed with exit code $_exit_code"
+            exit 1
+        fi
+    ' >> "$RALPH_DIR/logs/fix-workers.log" 2>&1 &
+
+    # Poll for agent.pid creation (10 × 0.1s)
+    local wait_count=0
+    while [ ! -f "$worker_dir/agent.pid" ] && [ $wait_count -lt 10 ]; do
+        sleep 0.1
+        ((++wait_count))
+    done
+
+    if [ -f "$worker_dir/agent.pid" ]; then
+        local agent_pid
+        agent_pid=$(cat "$worker_dir/agent.pid")
+        log "Fix agent running (PID: $agent_pid)"
+    else
+        # Brief wait then check if agent failed
+        sleep 0.3
+        if tail -5 "$RALPH_DIR/logs/fix-workers.log" 2>/dev/null | grep -q "ERROR:"; then
+            error "Fix agent failed to start. Check $RALPH_DIR/logs/fix-workers.log"
+        else
+            log "Fix agent started (PID file pending)"
+        fi
+    fi
+}
+
+# Resolve git merge conflicts in worker workspace
+cmd_task_resolve() {
+    local pattern="$1"
+    local no_fetch="$2"
+
+    if [ -z "$pattern" ]; then
+        error "Task pattern required"
+        echo "Usage: wiggum review task <pattern> resolve [--no-fetch]"
+        return 1
+    fi
+
+    # Find worker directory for this task
+    local worker_dir
+    worker_dir=$(find_worker_by_task_id "$RALPH_DIR" "$pattern")
+
+    if [ -z "$worker_dir" ] || [ ! -d "$worker_dir" ]; then
+        error "No worker directory found for pattern: $pattern"
+        return 1
+    fi
+
+    local workspace="$worker_dir/workspace"
+    if [ ! -d "$workspace" ]; then
+        error "Workspace not found: $workspace"
+        return 1
+    fi
+
+    # Verify workspace is a functional git repository (catches broken worktrees)
+    if ! git -C "$workspace" rev-parse HEAD &>/dev/null; then
+        error "Workspace is not a functional git repository (broken worktree?): $workspace"
+        error "The worktree may need to be recreated. Mark worker as failed or delete and restart."
+        return 1
+    fi
+
+    # Sync with main unless --no-fetch is specified
+    if [ "$no_fetch" != "true" ]; then
+        log "Fetching and merging origin/main..."
+
+        if ! git -C "$workspace" fetch origin main 2>&1; then
+            error "Failed to fetch origin/main"
+            return 1
+        fi
+
+        # Set git identity for automated merges
+        git_set_identity
+
+        # Commit any uncommitted changes before merge to prevent
+        # "Your local changes would be overwritten" errors
+        if ! git -C "$workspace" diff --quiet || ! git -C "$workspace" diff --cached --quiet; then
+            log "Working tree has uncommitted changes - committing before merge"
+            git -C "$workspace" add -A
+            git -C "$workspace" commit -m "chore: auto-commit before merge with main" || true
+        fi
+
+        # Try to merge main - this may create conflicts
+        if git -C "$workspace" merge origin/main --no-edit 2>&1; then
+            log "Merged origin/main successfully (no conflicts)"
+        else
+            log "Merge initiated - conflicts detected"
+        fi
+    fi
+
+    # Check for conflicts
+    local conflicted_files
+    conflicted_files=$(git -C "$workspace" diff --name-only --diff-filter=U 2>/dev/null)
+
+    if [ -z "$conflicted_files" ]; then
+        log "No merge conflicts detected in workspace"
+
+        # Transition state and commit/push any merge commits
+        # (This handles the case where origin/main was merged without conflicts)
+        git_state_set "$worker_dir" "resolved" "wiggum-review.cmd_task_resolve" "No conflicts after merge"
+
+        # Check if there's anything to commit (merge commit or staged changes)
+        if ! git -C "$workspace" diff --cached --quiet || \
+           ! git -C "$workspace" diff HEAD~1 --quiet 2>/dev/null; then
+            log "Committing and pushing merge resolution..."
+            cmd_task_commit "$pattern" || {
+                log "Warning: commit failed, but no conflicts remain"
+            }
+            cmd_task_push "$pattern" || {
+                log "Warning: push failed"
+                return 1
+            }
+        fi
+
+        git_state_set "$worker_dir" "needs_merge" "wiggum-review.cmd_task_resolve" "Ready for merge retry"
+        return 0
+    fi
+
+    local count
+    count=$(echo "$conflicted_files" | wc -l)
+    log "Found $count file(s) with merge conflicts"
+    # shellcheck disable=SC2001  # Can't use param expansion for multiline prefix
+    sed 's/^/  - /' <<< "$conflicted_files"
+    echo ""
+
+    log "Starting conflict resolver for $(basename "$worker_dir")"
+    log "Progress: $worker_dir/logs/resolve-*.log"
+
+    # Run agent (conversation logs go to logs/resolve-*.log)
+    run_agent "engineering.git-conflict-resolver" "$worker_dir" "$(pwd)" 0 \
+        > /dev/null 2>&1
+
+    local exit_code=$?
+
+    # Show results
+    if [ -f "$worker_dir/resolution-summary.md" ]; then
+        echo ""
+        echo "=== Resolution Summary ==="
+        cat "$worker_dir/resolution-summary.md"
+    fi
+
+    # Check remaining conflicts
+    local remaining
+    remaining=$(git -C "$workspace" diff --name-only --diff-filter=U 2>/dev/null)
+
+    if [ -z "$remaining" ]; then
+        log "All conflicts resolved and staged"
+
+        # Transition state and commit/push the resolution
+        git_state_set "$worker_dir" "resolved" "wiggum-review.cmd_task_resolve" "All conflicts resolved by agent"
+
+        log "Committing and pushing resolution..."
+        cmd_task_commit "$pattern" || {
+            log "Warning: commit failed after conflict resolution"
+        }
+        cmd_task_push "$pattern" || {
+            log "Warning: push failed"
+            git_state_set "$worker_dir" "failed" "wiggum-review.cmd_task_resolve" "Push failed after resolution"
+            return 1
+        }
+
+        git_state_set "$worker_dir" "needs_merge" "wiggum-review.cmd_task_resolve" "Ready for merge retry"
+    else
+        local remaining_count
+        remaining_count=$(echo "$remaining" | wc -l)
+        log "Warning: $remaining_count file(s) still have unresolved conflicts"
+        git_state_set "$worker_dir" "failed" "wiggum-review.cmd_task_resolve" "$remaining_count files still have conflicts"
+    fi
+
+    return $exit_code
+}
+
+# Create commit in worker workspace
+cmd_task_commit() {
+    local pattern="$1"
+
+    if [ -z "$pattern" ]; then
+        error "Task pattern required"
+        echo "Usage: wiggum review task <pattern> commit"
+        return 1
+    fi
+
+    # Find worker directory for this task
+    local worker_dir
+    worker_dir=$(find_worker_by_task_id "$RALPH_DIR" "$pattern")
+
+    if [ -z "$worker_dir" ] || [ ! -d "$worker_dir" ]; then
+        error "No worker directory found for pattern: $pattern"
+        return 1
+    fi
+
+    local workspace="$worker_dir/workspace"
+    if [ ! -d "$workspace" ]; then
+        error "Workspace not found: $workspace"
+        return 1
+    fi
+
+    local worker_id
+    worker_id=$(basename "$worker_dir")
+    # Extract task ID from worker ID (handles TASK-001, PIPELINE-001, etc.)
+    local task_id
+    task_id=$(echo "$worker_id" | sed -E 's/worker-([A-Za-z]{2,10}-[0-9]{1,4})-.*/\1/')
+
+    log "Creating commit for $task_id in $workspace"
+
+    # Get task description from kanban
+    local task_desc=""
+    local task_priority=""
+    if [ -f "$RALPH_DIR/kanban.md" ]; then
+        task_desc=$(grep -F "**[$task_id]**" "$RALPH_DIR/kanban.md" | sed 's/.*\*\*\[.*\]\*\* //' | head -1)
+        task_priority=$(grep -F -A2 "**[$task_id]**" "$RALPH_DIR/kanban.md" | grep "Priority:" | sed 's/.*Priority: //')
+    fi
+
+    log "Task: $task_id - ${task_desc:-<no description>}"
+
+    if git_create_commit "$workspace" "$task_id" "$task_desc" "$task_priority" "$worker_id"; then
+        log "✓ Commit created on branch: $GIT_COMMIT_BRANCH"
+        return 0
+    else
+        error "Failed to create commit"
+        return 1
+    fi
+}
+
+# Push worker branch to remote
+cmd_task_push() {
+    local pattern="$1"
+
+    if [ -z "$pattern" ]; then
+        error "Task pattern required"
+        echo "Usage: wiggum review task <pattern> push"
+        return 1
+    fi
+
+    # Find worker directory for this task
+    local worker_dir
+    worker_dir=$(find_worker_by_task_id "$RALPH_DIR" "$pattern")
+
+    if [ -z "$worker_dir" ] || [ ! -d "$worker_dir" ]; then
+        error "No worker directory found for pattern: $pattern"
+        return 1
+    fi
+
+    local workspace="$worker_dir/workspace"
+    if [ ! -d "$workspace" ]; then
+        error "Workspace not found: $workspace"
+        return 1
+    fi
+
+    cd "$workspace" || return 1
+
+    # Get current branch
+    local branch_name
+    branch_name=$(git rev-parse --abbrev-ref HEAD)
+
+    if [ "$branch_name" = "HEAD" ]; then
+        error "Not on a branch (detached HEAD). Run 'commit' first."
+        return 1
+    fi
+
+    log "Pushing branch $branch_name to remote..."
+
+    if git push -u origin "$branch_name" 2>&1; then
+        log "✓ Pushed branch $branch_name"
+        return 0
+    else
+        error "Failed to push branch"
+        return 1
+    fi
+}
+
+# Create PR for worker branch
+cmd_task_pr() {
+    local pattern="$1"
+
+    if [ -z "$pattern" ]; then
+        error "Task pattern required"
+        echo "Usage: wiggum review task <pattern> pr"
+        return 1
+    fi
+
+    # Find worker directory for this task
+    local worker_dir
+    worker_dir=$(find_worker_by_task_id "$RALPH_DIR" "$pattern")
+
+    if [ -z "$worker_dir" ] || [ ! -d "$worker_dir" ]; then
+        error "No worker directory found for pattern: $pattern"
+        return 1
+    fi
+
+    local workspace="$worker_dir/workspace"
+    if [ ! -d "$workspace" ]; then
+        error "Workspace not found: $workspace"
+        return 1
+    fi
+
+    local worker_id
+    worker_id=$(basename "$worker_dir")
+    local task_id
+    task_id=$(echo "$worker_id" | sed -E 's/worker-([A-Za-z]{2,10}-[0-9]{1,4})-.*/\1/')
+
+    cd "$workspace" || return 1
+
+    # Get current branch
+    local branch_name
+    branch_name=$(git rev-parse --abbrev-ref HEAD)
+
+    if [ "$branch_name" = "HEAD" ]; then
+        error "Not on a branch (detached HEAD). Run 'commit' first."
+        return 1
+    fi
+
+    # Check if branch is pushed
+    if ! git ls-remote --exit-code --heads origin "$branch_name" >/dev/null 2>&1; then
+        log "Branch not pushed. Pushing now..."
+        if ! git push -u origin "$branch_name" 2>&1; then
+            error "Failed to push branch"
+            return 1
+        fi
+    fi
+
+    # Get task description
+    local task_desc=""
+    if [ -f "$RALPH_DIR/kanban.md" ]; then
+        task_desc=$(grep -F "**[$task_id]**" "$RALPH_DIR/kanban.md" | sed 's/.*\*\*\[.*\]\*\* //' | head -1)
+    fi
+
+    log "Creating PR for $task_id on branch $branch_name"
+
+    if git_create_pr "$branch_name" "$task_id" "$task_desc" "$worker_dir" "$(pwd)"; then
+        log "✓ PR created: $GIT_PR_URL"
+        return 0
+    else
+        error "Failed to create PR (branch may already have a PR)"
+        return 1
+    fi
+}
+
+# Reset failed worker state for retry
+cmd_task_reset() {
+    local pattern="$1"
+    local target_state="${2:-needs_resolve}"
+
+    if [ -z "$pattern" ]; then
+        error "Task pattern required"
+        echo "Usage: wiggum review task <pattern> reset [state]"
+        echo "States: needs_resolve (default), needs_fix, needs_merge"
+        return 1
+    fi
+
+    # Find worker directory for this task
+    local worker_dir
+    worker_dir=$(find_worker_by_task_id "$RALPH_DIR" "$pattern")
+
+    if [ -z "$worker_dir" ] || [ ! -d "$worker_dir" ]; then
+        error "No worker directory found for pattern: $pattern"
+        return 1
+    fi
+
+    local worker_id
+    worker_id=$(basename "$worker_dir")
+    local git_state_file="$worker_dir/git-state.json"
+
+    if [ ! -f "$git_state_file" ]; then
+        error "No git-state.json found in $worker_dir"
+        return 1
+    fi
+
+    # Read current state
+    local current_state
+    current_state=$(jq -r '.current_state // "unknown"' "$git_state_file")
+
+    log "Resetting $worker_id"
+    log "  Current state: $current_state"
+    log "  Target state:  $target_state"
+
+    # Check if workspace is broken (worktree reference invalid)
+    local workspace="$worker_dir/workspace"
+    local workspace_broken=false
+    if [ -d "$workspace" ]; then
+        if ! git -C "$workspace" rev-parse HEAD &>/dev/null; then
+            workspace_broken=true
+            log "  Workspace:     BROKEN (will be removed for reconstruction)"
+        else
+            log "  Workspace:     OK"
+        fi
+    else
+        log "  Workspace:     MISSING (will be reconstructed)"
+    fi
+
+    # Update git-state.json
+    local tmp_file
+    tmp_file=$(mktemp)
+    jq --arg state "$target_state" '
+        .current_state = $state |
+        .merge_attempts = 0 |
+        .last_error = null |
+        .transitions += [{
+            "from": .current_state,
+            "to": $state,
+            "timestamp": (now | strftime("%Y-%m-%dT%H:%M:%S+00:00")),
+            "agent": "wiggum-review.cmd_task_reset",
+            "reason": "Manual reset for retry"
+        }]
+    ' "$git_state_file" > "$tmp_file"
+
+    if [ -s "$tmp_file" ]; then
+        mv "$tmp_file" "$git_state_file"
+        log "  git-state.json updated"
+    else
+        rm -f "$tmp_file"
+        error "Failed to update git-state.json"
+        return 1
+    fi
+
+    # Remove broken workspace so scheduler can reconstruct it
+    if [ "$workspace_broken" = true ]; then
+        rm -rf "$workspace"
+        log "  Removed broken workspace"
+    fi
+
+    log "✓ Reset complete - scheduler will pick up $worker_id"
+}
+
+# Parse verbose flags first
+WIGGUM_REMAINING_ARGS=(); parse_verbose_flags "$@"
+set -- ${WIGGUM_REMAINING_ARGS[@]:+"${WIGGUM_REMAINING_ARGS[@]}"}
+
+# Parse arguments
+AUTO_MERGE=false
+MERGE_METHOD="merge"
+NO_FETCH=false
+ARGS=()
+COMMAND="${1:-list}"
+
+shift 2>/dev/null || true
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            show_help
+            exit $EXIT_OK
+            ;;
+        --auto-merge)
+            AUTO_MERGE=true
+            shift
+            ;;
+        --squash)
+            MERGE_METHOD="squash"
+            shift
+            ;;
+        --rebase)
+            MERGE_METHOD="rebase"
+            shift
+            ;;
+        --no-fetch)
+            NO_FETCH=true
+            shift
+            ;;
+        *)
+            ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+# Execute command
+case "$COMMAND" in
+    list)
+        list_worker_prs
+        ;;
+    sync)
+        cmd_global_sync
+        ;;
+    pr)
+        PR_NUMBER="${ARGS[0]:-}"
+        PR_ACTION="${ARGS[1]:-}"
+        if [ -z "$PR_NUMBER" ]; then
+            error "PR number required"
+            echo "Usage: wiggum review pr [PR#] [view|merge]"
+            exit $EXIT_USAGE
+        fi
+        if [ -z "$PR_ACTION" ]; then
+            error "Action required"
+            echo "Usage: wiggum review pr [PR#] [view|merge]"
+            exit $EXIT_USAGE
+        fi
+        case "$PR_ACTION" in
+            view)
+                review_pr "$PR_NUMBER"
+                ;;
+            merge)
+                merge_pr "$PR_NUMBER" "$MERGE_METHOD"
+                ;;
+            *)
+                error "Unknown PR action: $PR_ACTION"
+                echo "Usage: wiggum review pr [PR#] [view|merge]"
+                exit $EXIT_USAGE
+                ;;
+        esac
+        ;;
+    task)
+        TASK_PATTERNS="${ARGS[0]}"
+        TASK_ACTION="${ARGS[1]}"
+
+        if [ -z "$TASK_PATTERNS" ]; then
+            error "Task pattern(s) required"
+            echo "Usage: wiggum review task <patterns> [sync|fix]"
+            exit $EXIT_USAGE
+        fi
+
+        # Check for --quick flag in remaining args (skips test verification)
+        USE_QUICK_MODE=false
+        for arg in "${ARGS[@]:2}"; do
+            if [ "$arg" = "--quick" ]; then
+                USE_QUICK_MODE=true
+            fi
+        done
+
+        case "${TASK_ACTION:-sync}" in
+            sync)
+                cmd_task_sync "$TASK_PATTERNS"
+                ;;
+            fix)
+                cmd_task_fix "$TASK_PATTERNS" "$USE_QUICK_MODE"
+                ;;
+            resolve)
+                cmd_task_resolve "$TASK_PATTERNS" "$NO_FETCH"
+                ;;
+            commit)
+                cmd_task_commit "$TASK_PATTERNS"
+                ;;
+            push)
+                cmd_task_push "$TASK_PATTERNS"
+                ;;
+            pr)
+                cmd_task_pr "$TASK_PATTERNS"
+                ;;
+            reset)
+                # Optional second arg is target state
+                TARGET_STATE="${ARGS[2]:-needs_resolve}"
+                cmd_task_reset "$TASK_PATTERNS" "$TARGET_STATE"
+                ;;
+            *)
+                error "Unknown task action: $TASK_ACTION"
+                echo "Valid actions: sync, fix, resolve, commit, push, pr, reset"
+                exit $EXIT_USAGE
+                ;;
+        esac
+        ;;
+    merge-all)
+        merge_all_prs "$AUTO_MERGE" "$MERGE_METHOD"
+        ;;
+    cleanup)
+        cleanup_branches
+        ;;
+    status)
+        show_status
+        ;;
+    -h|--help)
+        show_help
+        ;;
+    *)
+        error "Unknown command: $COMMAND"
+        echo ""
+        show_help
+        exit $EXIT_USAGE
+        ;;
+esac

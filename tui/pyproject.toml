@@ -1,0 +1,26 @@
+[project]
+name = "wiggum-tui"
+version = "0.1.0"
+description = "htop-like TUI for Chief Wiggum worker monitoring"
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=0.47.0",
+    "watchfiles>=0.21.0",
+    "rich>=13.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[project.scripts]
+wiggum-tui = "wiggum_tui.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]

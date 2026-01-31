@@ -1,0 +1,254 @@
+#!/opt/homebrew/bin/bash
+# Chief Wiggum - Worker orchestration runner
+#
+# Orchestrates workers for executing software engineering tasks. Uses the
+# scheduler module for unified worker tracking, priority workers, and status display.
+set -euo pipefail
+
+WIGGUM_HOME="${WIGGUM_HOME:-$HOME/.claude/chief-wiggum}"
+PROJECT_DIR="$(pwd)"
+RALPH_DIR="${RALPH_DIR:-$PROJECT_DIR/.ralph}"
+
+# Source shared libraries
+source "$WIGGUM_HOME/lib/core/exit-codes.sh"
+source "$WIGGUM_HOME/lib/core/defaults.sh"
+source "$WIGGUM_HOME/lib/core/verbose-flags.sh"
+source "$WIGGUM_HOME/lib/core/logger.sh"
+source "$WIGGUM_HOME/lib/core/file-lock.sh"
+source "$WIGGUM_HOME/lib/utils/audit-logger.sh"
+source "$WIGGUM_HOME/lib/utils/activity-log.sh"
+source "$WIGGUM_HOME/lib/worker/worker-lifecycle.sh"
+source "$WIGGUM_HOME/lib/worker/git-state.sh"
+source "$WIGGUM_HOME/lib/runtime/runtime.sh"
+source "$WIGGUM_HOME/lib/backend/claude/usage-tracker.sh"
+source "$WIGGUM_HOME/lib/git/worktree-helpers.sh"
+source "$WIGGUM_HOME/lib/tasks/task-parser.sh"
+source "$WIGGUM_HOME/lib/tasks/plan-parser.sh"
+source "$WIGGUM_HOME/lib/tasks/conflict-detection.sh"
+
+# Source scheduler module (unified worker management)
+source "$WIGGUM_HOME/lib/scheduler/scheduler.sh"
+source "$WIGGUM_HOME/lib/scheduler/conflict-queue.sh"
+source "$WIGGUM_HOME/lib/scheduler/conflict-registry.sh"
+source "$WIGGUM_HOME/lib/scheduler/pr-merge-optimizer.sh"
+source "$WIGGUM_HOME/lib/scheduler/orchestrator-functions.sh"
+source "$WIGGUM_HOME/lib/scheduler/terminal-header.sh"
+source "$WIGGUM_HOME/lib/scheduler/smart-routing.sh"
+
+# Service-based scheduler (consolidated module includes core + state)
+source "$WIGGUM_HOME/lib/service/service-scheduler.sh"
+# Service handlers (svc_* functions callable via services.json)
+source "$WIGGUM_HOME/lib/services/orchestrator-handlers.sh"
+# Orchestrator directory migration (old paths → new paths)
+source "$WIGGUM_HOME/lib/orchestrator/migration.sh"
+# Orchestrator lifecycle (validation, locking, signals, rate-limit pause)
+source "$WIGGUM_HOME/lib/orchestrator/lifecycle.sh"
+# CLI argument parsing (extracted from main)
+source "$WIGGUM_HOME/lib/orchestrator/arg-parser.sh"
+
+# Default configuration (globals used by sourced modules: arg-parser, lifecycle, handlers)
+# shellcheck disable=SC2034
+MAX_WORKERS=4
+# shellcheck disable=SC2034
+MAX_ITERATIONS=20       # Max outer loop iterations per worker
+# shellcheck disable=SC2034
+MAX_TURNS=50           # Max turns per Claude session
+AGENT_TYPE="system.task-worker"  # Default agent type (can be overridden with 'plan' mode)
+PID_WAIT_TIMEOUT=300   # Deciseconds to wait for agent.pid (30 seconds)
+# shellcheck disable=SC2034
+FORCE_LOCK=false       # --force flag state for lock override
+MAX_SKIP_RETRIES=3     # Kanban update failures before permanent skip
+FIX_WORKER_TIMEOUT=7200  # Fix worker max runtime (seconds)
+FIX_WORKER_LIMIT=""    # Max concurrent fix workers (loaded from config or CLI)
+RESOLVE_WORKER_TIMEOUT=7200  # Resolve worker max runtime (seconds)
+AGING_FACTOR=7         # Scheduling events per priority level promotion
+SIBLING_WIP_PENALTY=20000  # Fixed-point penalty when sibling is WIP (20000 = 2.0)
+PLAN_BONUS=15000           # Fixed-point bonus for tasks with plans (15000 = 1.5)
+DEP_BONUS_PER_TASK=7000    # Fixed-point bonus per task blocked (7000 = 0.7)
+WIGGUM_RUN_MODE="default"  # default | fix-only | merge-only
+
+show_help() {
+    cat << EOF
+wiggum run - Orchestrate workers for incomplete tasks
+
+Usage: wiggum run [mode] [options]
+
+Modes:
+  (default)            Use system.task-worker agent (standard execution)
+  plan                 Use system.task-worker agent with plan mode enabled (creates
+                       implementation plan before execution)
+  --smart              Dynamically select pipeline and plan mode per task based on
+                       complexity inferred from kanban metadata (scope items,
+                       acceptance criteria, description length)
+  --fix-only           Skip spawning new workers. Only fix existing PRs (review
+                       comments, test failures) and merge them
+  --merge-only         Skip new workers AND fix workers. Only merge PRs that are
+                       ready and resolve merge conflicts
+
+Options:
+  --max-workers N      Maximum concurrent workers (default: 4)
+  --max-iters N        Maximum iterations per worker (default: 20)
+  --max-turns N        Maximum turns per Claude session (default: 50)
+  --fix-agents N       Maximum concurrent fix/resolve workers (default: 2, or config)
+  --pipeline NAME      Pipeline config to use (from config/pipelines/ or config/)
+  --text               Disable terminal header, print raw logs to stdout
+  --force              Override stale orchestrator lock
+  -v, --verbose        Verbose output (same as default)
+  -vv                  Debug output (detailed diagnostics)
+  -vvv                 Trace output (very detailed tracing)
+  -q, --quiet          Quiet mode (warnings and errors only)
+  -h, --help           Show this help message
+
+Examples:
+  wiggum run                              # Start orchestration with defaults
+  wiggum run plan                         # Use planning mode for all workers
+  wiggum run --smart                      # Auto-select pipeline/plan per task
+  wiggum run --smart --max-workers 2      # Smart mode with 2 workers
+  wiggum run --max-workers 8              # Start with max 8 workers
+  wiggum run plan --max-workers 2         # Planning mode with 2 workers
+  wiggum run --pipeline fast              # Use the fast pipeline
+  wiggum run --text                        # Raw log output (no terminal UI)
+  wiggum run --fix-only                   # Only fix and merge existing PRs
+  wiggum run --merge-only                 # Only merge ready PRs
+
+Behavior:
+  - Chief assigns pending tasks [ ] to workers based on dependency graph
+  - Tasks are scheduled by priority: HIGH > MEDIUM > LOW
+  - Tasks with unsatisfied dependencies are blocked until deps complete
+  - Tasks are marked in-progress [=] when assigned
+  - Workers mark tasks pending approval [P] when PR is created
+  - Periodic sync updates [P] -> [x] when PRs are merged
+  - Chief waits until all tasks are complete [x]
+  - New workers spawn as old ones finish (up to max)
+  - Circular dependencies are detected and reported at startup
+
+Task resumption:
+  - WIP tasks [=] with stopped workers are auto-resumed (if no worker is running)
+  - Failed tasks [*] wait for manual intervention (use 'wiggum resume/retry')
+  - Pending tasks [ ] with existing PRs go through fix pipeline (sync→fix→push→merge)
+
+Logging:
+  - Output is written to both stdout and .ralph/logs/orchestrator.log
+  - Worker logs are in .ralph/logs/workers.log
+  - Use 'tail -f .ralph/logs/orchestrator.log' to follow in another terminal
+
+EOF
+}
+
+# =============================================================================
+# Main Entry Point
+# =============================================================================
+
+main() {
+    # Raise file descriptor limit (orchestrator spawns many subprocesses per tick)
+    # Default 1024 on some systems (NixOS) is insufficient for the jq/fork overhead.
+    # Try 65536 first, fall back to doubling the current limit.
+    local _cur_nofile
+    _cur_nofile=$(ulimit -n 2>/dev/null) || _cur_nofile=1024
+    if [ "$_cur_nofile" -lt 8192 ]; then
+        ulimit -n 65536 2>/dev/null || ulimit -n 8192 2>/dev/null || ulimit -n 4096 2>/dev/null || true
+    fi
+
+    # Parse verbose flags first
+    WIGGUM_REMAINING_ARGS=(); parse_verbose_flags "$@"
+    set -- ${WIGGUM_REMAINING_ARGS[@]:+"${WIGGUM_REMAINING_ARGS[@]}"}
+
+    # Parse run options (extracted to lib/orchestrator/arg-parser.sh)
+    _parse_run_args "$@"
+
+    # Validate project structure
+    _validate_project
+
+    # Migrate old .ralph/ layout to new directory structure
+    _migrate_ralph_layout "$RALPH_DIR"
+
+    # Ensure logs directory exists and set up file logging
+    mkdir -p "$RALPH_DIR/logs"
+    export LOG_FILE="$RALPH_DIR/logs/orchestrator.log"
+    log "Orchestrator log: $LOG_FILE"
+
+    # Load rate limit configuration
+    load_rate_limit_config
+
+    # Load workers configuration (fix_worker_limit)
+    load_workers_config
+    # CLI --fix-agents takes precedence over config
+    FIX_WORKER_LIMIT="${FIX_WORKER_LIMIT:-$WIGGUM_FIX_WORKER_LIMIT}"
+
+    # Initialize activity log
+    activity_init "$PROJECT_DIR"
+
+    # Acquire lock and setup signals (extracted to lib/orchestrator/lifecycle.sh)
+    _acquire_lock
+    _setup_signals
+
+    # Initialize service scheduler (loads services.json, project overrides, runner)
+    service_scheduler_init "$RALPH_DIR" "$PROJECT_DIR"
+
+    # Apply run-mode service restrictions
+    if [[ "$WIGGUM_RUN_MODE" == "merge-only" ]]; then
+        _SERVICE_JSON=$(echo "$_SERVICE_JSON" | jq '
+            .services |= map(
+                if .id == "fix-workers" or .id == "multi-pr-planner"
+                then .enabled = false
+                else . end)')
+        log "Merge-only mode: disabled fix-workers, multi-pr-planner services"
+    elif [[ "$WIGGUM_RUN_MODE" == "fix-only" ]]; then
+        log "Fix-only mode: task spawning disabled"
+    fi
+
+    # Invalidate service config cache after run-mode modifications to _SERVICE_JSON
+    if [[ "$WIGGUM_RUN_MODE" != "default" ]]; then
+        _service_populate_cache
+    fi
+
+    # Export configuration for service handlers
+    export WIGGUM_HOME PROJECT_DIR RALPH_DIR
+    export MAX_WORKERS MAX_ITERATIONS MAX_TURNS AGENT_TYPE
+    export WIGGUM_RUN_MODE
+    export FIX_WORKER_LIMIT FIX_WORKER_TIMEOUT RESOLVE_WORKER_TIMEOUT
+    export AGING_FACTOR SIBLING_WIP_PENALTY PLAN_BONUS DEP_BONUS_PER_TASK
+    export MAX_SKIP_RETRIES PID_WAIT_TIMEOUT
+
+    # Startup phase (sequential, synchronous)
+    # Runs: validate-kanban, init-scheduler, preflight-git, preflight-ssh,
+    #       preflight-gh, restore-workers, resume-workers, init-terminal
+    if ! service_scheduler_run_phase "startup"; then
+        log_error "Startup phase failed, aborting"
+        exit 1
+    fi
+
+    # Clear stale exit signal from previous run
+    rm -f "$RALPH_DIR/orchestrator/should-exit"
+
+    _ORCH_ITERATION=0
+    log "Starting service-based scheduler"
+
+    # Main loop: service-driven orchestration
+    while [ ! -f "$RALPH_DIR/orchestrator/should-exit" ]; do
+        ((++_ORCH_ITERATION))
+
+        # Handle rate-limit pause from previous session
+        _check_rate_limit_pause
+
+        # Pre-phase: pool ingest, resume poll, worker cleanup
+        service_scheduler_run_phase "pre"
+
+        # Periodic phase: interval/cron/event services (pr-sync, fix-workers, etc.)
+        service_scheduler_run_phase "periodic"
+
+        # Post-phase: completion check, rate limit, scheduler tick, task spawn,
+        #             skip decay, orphan detection, aging, status display, state save
+        service_scheduler_run_phase "post"
+
+        sleep 1
+    done
+
+    # Shutdown phase (reverse order: state save, terminal cleanup, lock cleanup)
+    service_scheduler_run_phase "shutdown"
+
+    # Display final summary
+    _display_final_summary
+}
+
+main "$@"

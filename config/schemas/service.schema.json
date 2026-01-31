@@ -1,0 +1,509 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Service Configuration",
+  "description": "Defines orchestrator services that run at configurable intervals",
+  "type": "object",
+  "required": ["version", "services"],
+  "properties": {
+    "version": {
+      "type": "string",
+      "description": "Schema version",
+      "enum": ["1.0", "1.1"]
+    },
+    "defaults": {
+      "$ref": "#/$defs/defaults"
+    },
+    "groups": {
+      "$ref": "#/$defs/group_definitions"
+    },
+    "services": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/service"
+      }
+    }
+  },
+  "$defs": {
+    "defaults": {
+      "type": "object",
+      "description": "Default configuration applied to all services",
+      "properties": {
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 300,
+          "description": "Default timeout in seconds for service execution"
+        },
+        "restart_policy": {
+          "$ref": "#/$defs/restart_policy"
+        },
+        "circuit_breaker": {
+          "$ref": "#/$defs/circuit_breaker"
+        }
+      },
+      "additionalProperties": false
+    },
+    "restart_policy": {
+      "type": "object",
+      "description": "Policy for handling service failures",
+      "properties": {
+        "on_failure": {
+          "type": "string",
+          "enum": ["retry", "skip", "abort"],
+          "default": "skip",
+          "description": "Action when service fails"
+        },
+        "max_retries": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 2,
+          "description": "Maximum retry attempts before giving up"
+        },
+        "backoff": {
+          "$ref": "#/$defs/backoff"
+        }
+      },
+      "additionalProperties": false
+    },
+    "backoff": {
+      "type": "object",
+      "description": "Exponential backoff configuration for retries",
+      "properties": {
+        "initial": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5,
+          "description": "Initial backoff delay in seconds"
+        },
+        "multiplier": {
+          "type": "number",
+          "minimum": 1,
+          "default": 2,
+          "description": "Multiplier applied to delay after each retry"
+        },
+        "max": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 300,
+          "description": "Maximum backoff delay in seconds"
+        }
+      },
+      "additionalProperties": false
+    },
+    "circuit_breaker": {
+      "type": "object",
+      "description": "Circuit breaker pattern to disable failing services",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable circuit breaker"
+        },
+        "threshold": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 5,
+          "description": "Number of consecutive failures before opening circuit"
+        },
+        "cooldown": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 300,
+          "description": "Seconds to wait before attempting recovery"
+        },
+        "half_open_requests": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "Number of test requests in half-open state"
+        }
+      },
+      "additionalProperties": false
+    },
+    "group_definitions": {
+      "type": "object",
+      "description": "Named groups of services for bulk operations",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": "string",
+            "description": "Human-readable description of the group"
+          },
+          "enabled": {
+            "type": "boolean",
+            "default": true,
+            "description": "Enable/disable all services in this group"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "service": {
+      "type": "object",
+      "required": ["id", "schedule", "execution"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_-]*$",
+          "description": "Unique service identifier"
+        },
+        "description": {
+          "type": "string",
+          "description": "Human-readable description of what the service does"
+        },
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Whether the service is enabled"
+        },
+        "groups": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Groups this service belongs to"
+        },
+        "depends_on": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Service IDs that must complete successfully before this service runs"
+        },
+        "schedule": {
+          "$ref": "#/$defs/schedule"
+        },
+        "execution": {
+          "$ref": "#/$defs/execution"
+        },
+        "condition": {
+          "$ref": "#/$defs/condition"
+        },
+        "concurrency": {
+          "$ref": "#/$defs/concurrency"
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Override default timeout for this service"
+        },
+        "restart_policy": {
+          "$ref": "#/$defs/restart_policy"
+        },
+        "circuit_breaker": {
+          "$ref": "#/$defs/circuit_breaker"
+        },
+        "health": {
+          "$ref": "#/$defs/health_check"
+        },
+        "limits": {
+          "$ref": "#/$defs/resource_limits"
+        },
+        "metrics": {
+          "$ref": "#/$defs/metrics_config"
+        }
+      },
+      "additionalProperties": false
+    },
+    "schedule": {
+      "type": "object",
+      "required": ["type"],
+      "oneOf": [
+        { "$ref": "#/$defs/interval_schedule" },
+        { "$ref": "#/$defs/event_schedule" },
+        { "$ref": "#/$defs/continuous_schedule" },
+        { "$ref": "#/$defs/cron_schedule" }
+      ]
+    },
+    "interval_schedule": {
+      "type": "object",
+      "required": ["type", "interval"],
+      "properties": {
+        "type": {
+          "const": "interval"
+        },
+        "interval": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Interval in seconds between executions"
+        },
+        "jitter": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Random jitter in seconds to add to interval (prevents thundering herd)"
+        },
+        "run_on_startup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run immediately on startup before waiting for first interval"
+        }
+      },
+      "additionalProperties": false
+    },
+    "cron_schedule": {
+      "type": "object",
+      "required": ["type", "cron"],
+      "properties": {
+        "type": {
+          "const": "cron"
+        },
+        "cron": {
+          "type": "string",
+          "pattern": "^[0-9*,/-]+\\s+[0-9*,/-]+\\s+[0-9*,/-]+\\s+[0-9*,/-]+\\s+[0-9*,/-]+$",
+          "description": "Cron expression (minute hour day month weekday)"
+        },
+        "timezone": {
+          "type": "string",
+          "default": "UTC",
+          "description": "Timezone for cron expression evaluation"
+        },
+        "run_on_startup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run immediately on startup"
+        }
+      },
+      "additionalProperties": false
+    },
+    "event_schedule": {
+      "type": "object",
+      "required": ["type", "trigger"],
+      "properties": {
+        "type": {
+          "const": "event"
+        },
+        "trigger": {
+          "type": "string",
+          "description": "Event name that triggers this service (e.g., 'worker.completed', 'scheduling_event')"
+        }
+      },
+      "additionalProperties": false
+    },
+    "continuous_schedule": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "const": "continuous"
+        },
+        "restart_delay": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 5,
+          "description": "Delay in seconds before restarting after completion"
+        }
+      },
+      "additionalProperties": false
+    },
+    "condition": {
+      "type": "object",
+      "description": "Conditions that must be met for service to run",
+      "properties": {
+        "file_exists": {
+          "type": "string",
+          "description": "Glob pattern - service runs only if matching files exist"
+        },
+        "file_not_exists": {
+          "type": "string",
+          "description": "Glob pattern - service runs only if no matching files exist"
+        },
+        "env_set": {
+          "type": "string",
+          "description": "Environment variable that must be set"
+        },
+        "env_equals": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Environment variables that must equal specific values"
+        },
+        "command": {
+          "type": "string",
+          "description": "Shell command that must exit 0 for condition to pass"
+        }
+      },
+      "additionalProperties": false
+    },
+    "execution": {
+      "type": "object",
+      "required": ["type"],
+      "oneOf": [
+        { "$ref": "#/$defs/command_execution" },
+        { "$ref": "#/$defs/function_execution" },
+        { "$ref": "#/$defs/pipeline_execution" }
+      ]
+    },
+    "command_execution": {
+      "type": "object",
+      "required": ["type", "command"],
+      "properties": {
+        "type": {
+          "const": "command"
+        },
+        "command": {
+          "type": "string",
+          "description": "Shell command to execute"
+        },
+        "working_dir": {
+          "type": "string",
+          "description": "Working directory for command execution"
+        }
+      },
+      "additionalProperties": false
+    },
+    "function_execution": {
+      "type": "object",
+      "required": ["type", "function"],
+      "properties": {
+        "type": {
+          "const": "function"
+        },
+        "function": {
+          "type": "string",
+          "description": "Bash function name to call"
+        },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Arguments to pass to the function"
+        }
+      },
+      "additionalProperties": false
+    },
+    "pipeline_execution": {
+      "type": "object",
+      "required": ["type", "pipeline"],
+      "properties": {
+        "type": {
+          "const": "pipeline"
+        },
+        "pipeline": {
+          "type": "string",
+          "description": "Pipeline name to execute"
+        }
+      },
+      "additionalProperties": false
+    },
+    "concurrency": {
+      "type": "object",
+      "description": "Concurrency control for the service",
+      "properties": {
+        "max_instances": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1,
+          "description": "Maximum concurrent instances of this service"
+        },
+        "if_running": {
+          "type": "string",
+          "enum": ["skip", "queue", "kill"],
+          "default": "skip",
+          "description": "Action when service is already running: skip (don't start), queue (wait), kill (stop old)"
+        },
+        "queue_max": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 10,
+          "description": "Maximum queued executions (when if_running=queue)"
+        },
+        "priority": {
+          "type": "string",
+          "enum": ["low", "normal", "high", "critical"],
+          "default": "normal",
+          "description": "Priority in the execution queue"
+        }
+      },
+      "additionalProperties": false
+    },
+    "health_check": {
+      "type": "object",
+      "description": "Health check configuration to detect stuck services",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["file", "command", "heartbeat"],
+          "description": "Type of health check"
+        },
+        "path": {
+          "type": "string",
+          "description": "File path for 'file' type health checks"
+        },
+        "command": {
+          "type": "string",
+          "description": "Command to run for 'command' type health checks"
+        },
+        "max_age": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 60,
+          "description": "Maximum age in seconds before considering service unhealthy"
+        },
+        "interval": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 30,
+          "description": "How often to run health checks in seconds"
+        },
+        "on_unhealthy": {
+          "type": "string",
+          "enum": ["restart", "kill", "log"],
+          "default": "log",
+          "description": "Action to take when service becomes unhealthy"
+        }
+      },
+      "additionalProperties": false
+    },
+    "resource_limits": {
+      "type": "object",
+      "description": "Resource limits for service execution",
+      "properties": {
+        "memory": {
+          "type": "string",
+          "pattern": "^[0-9]+[KMG]?$",
+          "description": "Memory limit (e.g., '512M', '1G')"
+        },
+        "cpu": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 100,
+          "description": "CPU limit as percentage (e.g., 50 for 50%)"
+        },
+        "timeout_kill": {
+          "type": "boolean",
+          "default": true,
+          "description": "Kill process if timeout is exceeded"
+        },
+        "nice": {
+          "type": "integer",
+          "minimum": -20,
+          "maximum": 19,
+          "default": 0,
+          "description": "Process niceness (priority adjustment)"
+        }
+      },
+      "additionalProperties": false
+    },
+    "metrics_config": {
+      "type": "object",
+      "description": "Metrics collection configuration",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable metrics collection for this service"
+        },
+        "emit_to": {
+          "type": "string",
+          "enum": ["activity", "metrics", "both"],
+          "default": "activity",
+          "description": "Where to emit metrics"
+        },
+        "include_output": {
+          "type": "boolean",
+          "default": false,
+          "description": "Include service output in metrics"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
