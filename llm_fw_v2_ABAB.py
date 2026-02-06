@@ -1045,6 +1045,42 @@ def _test_prompts_v2() -> None:
         _t(f"PROMPTS.{n} is non-empty str", isinstance(val, str) and len(val) > 20, f"{len(val or '')} chars")
 
 
+def _test_tmux_uses_panes_not_windows() -> None:
+    """R17.3: _run_all_tmux must split-window (panes), NOT new-window (tabs)."""
+    import inspect
+    src = inspect.getsource(_run_all_tmux)
+    _t("tmux uses split-window", "split-window" in src)
+    _t("tmux does NOT use new-window", "new-window" not in src)
+
+
+def _test_tmux_graceful_split_failure() -> None:
+    """R17.5: split-window must NOT use check=True — handle 'no space' gracefully."""
+    import inspect
+    src = inspect.getsource(_run_all_tmux)
+    # extract lines around the actual split-window subprocess call (not docstring)
+    lines = src.splitlines()
+    split_lines = [i for i, ln in enumerate(lines) if "split-window" in ln and '"""' not in ln and "#" not in ln]
+    if split_lines:
+        # check the 5 lines around the subprocess call for check=True
+        idx = split_lines[0]
+        call_block = "\n".join(lines[max(0, idx-2):idx+5])
+        _t("split-window has no check=True", "check=True" not in call_block,
+           "split-window call must handle failure gracefully")
+    else:
+        _t("split-window has no check=True", False, "no split-window call found")
+    _t("split failure has break", "break" in src,
+       "must break out of loop when split fails")
+    _t("split uses capture_output", "capture_output" in src)
+
+
+def _test_tmux_tiled_layout() -> None:
+    """R17.3: After creating panes, must apply tiled layout for grid view."""
+    import inspect
+    src = inspect.getsource(_run_all_tmux)
+    _t("tmux applies tiled layout", "tiled" in src)
+    _t("tmux uses select-layout", "select-layout" in src)
+
+
 # ─── test runner ──────────────────────────────────────────────
 
 async def _run_tests() -> None:
@@ -1062,6 +1098,10 @@ async def _run_tests() -> None:
     _test_parse_full_worker_output()
     _test_config_v2()
     _test_prompts_v2()
+
+    _test_tmux_uses_panes_not_windows()
+    _test_tmux_graceful_split_failure()
+    _test_tmux_tiled_layout()
 
     CON.rule("[bold magenta]INTEGRATION TESTS — LLM calls[/]")
     # quick smoke test: LLM responds
@@ -1081,12 +1121,11 @@ async def _run_tests() -> None:
 # ─────────────── EXAMPLE RUNNER / TMUX ────────────────────────
 
 def _run_all_tmux() -> None:
-    """Launch all examples in separate tmux windows (one per example).
+    """Launch all examples in a tiled tmux pane grid (split-window).
 
-    Uses windows (tabs) instead of panes to avoid 'no space for new pane'
-    when terminal is too small for 8 splits. Each example gets a full-size
-    terminal. Navigate: Ctrl-b n (next) / Ctrl-b p (prev).
-    Stagger starts 0.3s apart to avoid rate-limit burst.
+    Creates one session, splits into N panes with tiled layout.
+    Graceful degradation: if terminal is too small for all panes,
+    runs as many as fit and warns. Stagger starts 0.3s apart.
     """
     names = PROMPTS.names()
     session = "ralph-v2-all"
@@ -1094,34 +1133,42 @@ def _run_all_tmux() -> None:
 
     subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
 
-    # create session — first window named after first example
+    # create session with generous size — first pane already exists
     subprocess.run([
-        "tmux", "new-session", "-d", "-s", session, "-n", names[0],
+        "tmux", "new-session", "-d", "-s", session, "-x", "250", "-y", "70",
     ], check=True)
     subprocess.run(
         ["tmux", "set-option", "-t", session, "remain-on-exit", "on"],
         capture_output=True,
     )
 
-    # create a new window for each remaining example
-    for n in names[1:]:
-        subprocess.run([
-            "tmux", "new-window", "-t", session, "-n", n,
-        ], check=True)
+    # split into panes — rebalance after each split so next has room
+    pane_count = 1
+    for _ in names[1:]:
+        r = subprocess.run(
+            ["tmux", "split-window", "-t", session],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            CON.print(f"[bold yellow]tmux: only {pane_count}/{len(names)} panes fit "
+                      f"(terminal too small?) — running {pane_count}[/]")
+            break
+        pane_count += 1
+        subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], capture_output=True)
 
-    # send staggered commands to each window
-    for i, n in enumerate(names):
+    # final tiled layout pass
+    subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], capture_output=True)
+
+    # send staggered commands to each pane
+    for i, n in enumerate(names[:pane_count]):
         delay = f"sleep {i * 0.3:.1f} && " if i > 0 else ""
         subprocess.run([
-            "tmux", "send-keys", "-t", f"{session}:{n}",
+            "tmux", "send-keys", "-t", f"{session}:{0}.{i}",
             f"{delay}uv run {script} --example {n}", "Enter",
         ], check=True)
 
-    # select first window
-    subprocess.run(["tmux", "select-window", "-t", f"{session}:{names[0]}"], capture_output=True)
-
-    CON.print(f"[bold green]launched {len(names)} examples in tmux session '{session}'[/]")
-    CON.print(f"[dim]attach: tmux attach -t {session}  |  Ctrl-b n/p to switch  |  kill: tmux kill-session -t {session}[/]")
+    CON.print(f"[bold green]launched {pane_count}/{len(names)} examples in tmux session '{session}'[/]")
+    CON.print(f"[dim]attach: tmux attach -t {session}  |  kill: tmux kill-session -t {session}[/]")
     if sys.stdout.isatty():
         os.execvp("tmux", ["tmux", "attach", "-t", session])
     else:
