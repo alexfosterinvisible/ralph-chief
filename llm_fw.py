@@ -109,9 +109,82 @@ class CONFIG:
     AGENT_PROMPT_FILE: str = "AGENT_PROMPT.md"  # overrides AGENT_PROMPT if exists
     AGENT_LOGS_DIR: str = "agent_logs"
     LOOP_COOLDOWN: float = 1.0        # seconds between iterations
+    MAX_ITERATIONS: int = 0           # 0 = infinite, >0 = bounded
 
 
 CFG = CONFIG()
+
+
+# ─────────────── EXAMPLE PROMPTS ─────────────────────────────
+# Tuple format: multi-line strings, comments between lines.
+# Usage: uv run llm_fw.py --example <name>
+
+class PROMPTS:
+    """Example prompts that exercise the ralph loop sensibly."""
+
+    # ── code review: analyze a real file in the repo ──
+    code_review = (
+        "Review the file llm_fw.py in this repository.\n"
+        "1. List every function and its purpose (1-line each).\n"
+        "2. Identify the top 3 code smells or improvements.\n"
+        "3. For each improvement, show the exact diff you'd apply.\n"
+        "4. Rate overall code quality 1-10 with justification.\n"
+        # agent should produce structured, actionable output
+        "5. STATUS: summarize findings, suggest next iteration focus."
+    )
+
+    # ── feature design: plan a new capability ──
+    feature_design = (
+        "Design a retry-with-circuit-breaker for the LLM caller.\n"
+        "1. Define the state machine: CLOSED → OPEN → HALF-OPEN.\n"
+        "2. Specify thresholds: failure count, timeout, half-open probe.\n"
+        "3. Write the Python dataclass for CircuitBreaker state.\n"
+        "4. Write the async wrapper function with full type hints.\n"
+        "5. Write 3 unit tests (pytest style) covering each transition.\n"
+        # each iteration should produce deeper / more refined output
+        "6. STATUS: what's designed, what needs refinement, what's next."
+    )
+
+    # ── bug hunt: find and fix a hypothetical issue ──
+    bug_hunt = (
+        "The streaming response sometimes returns empty text.\n"
+        "1. Trace the data flow: API call → stream chunks → join → return.\n"
+        "2. List every place where empty/None could leak through.\n"
+        "3. For each, propose a defensive check with exact code.\n"
+        "4. Write a test that reproduces empty-response edge case.\n"
+        "5. STATUS: root causes found, fixes proposed, confidence level."
+    )
+
+    # ── refactor: simplify existing code ──
+    refactor = (
+        "Refactor the CONFIG dataclass in llm_fw.py.\n"
+        "1. Group related fields into nested dataclasses (ModelCfg, RetryCfg, etc).\n"
+        "2. Add validation in __post_init__ (e.g. MAX_TOKENS > 0).\n"
+        "3. Add a .from_env() classmethod that loads from env vars.\n"
+        "4. Show the complete refactored code.\n"
+        "5. STATUS: what changed, what's cleaner, backwards-compat notes."
+    )
+
+    # ── architecture: design a multi-agent system ──
+    architecture = (
+        "Design a parallel agent system (like anthropic.com/engineering/building-c-compiler).\n"
+        "1. Define the coordination protocol: task locks, git sync, conflict resolution.\n"
+        "2. Sketch the Docker container setup for N parallel agents.\n"
+        "3. Define the AGENT_PROMPT.md that each agent reads.\n"
+        "4. Show the bash harness (while-true loop + git push/pull).\n"
+        "5. STATUS: architecture complete? gaps? next steps?"
+    )
+
+    @classmethod
+    def get(cls, name: str) -> str | None:
+        """Lookup prompt by name, return None if not found."""
+        val = getattr(cls, name, None)
+        return val if isinstance(val, str) else None
+
+    @classmethod
+    def names(cls) -> list[str]:
+        """All available prompt names."""
+        return [k for k in vars(cls) if not k.startswith("_") and isinstance(getattr(cls, k), str)]
 CON = Console()
 
 # ─────────────── GLOBAL SEMAPHORE (cross-async safe) ─────────
@@ -235,21 +308,34 @@ async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> None:
     each iteration reads agent prompt fresh, gets git commit,
     calls LLM, logs output, repeats.
     """
+    bound = f"max {cfg.MAX_ITERATIONS}" if cfg.MAX_ITERATIONS > 0 else "infinite"
     CON.rule("[bold magenta]ralph loop — oss120b (no tool-use)[/]")
     CON.print(f"[bold yellow]user prompt:[/] {prompt}")
-    CON.print(f"[dim]cooldown: {cfg.LOOP_COOLDOWN}s  |  logs: {cfg.AGENT_LOGS_DIR}/[/]\n")
+    CON.print(f"[dim]cooldown: {cfg.LOOP_COOLDOWN}s  |  iterations: {bound}  |  logs: {cfg.AGENT_LOGS_DIR}/[/]\n")
 
     iteration = 0
     while True:
         iteration += 1
+        if cfg.MAX_ITERATIONS > 0 and iteration > cfg.MAX_ITERATIONS:
+            CON.rule(f"[bold green]done — {cfg.MAX_ITERATIONS} iterations complete[/]")
+            break
+
         commit = _git_short()
         logfile = Path(cfg.AGENT_LOGS_DIR) / f"agent_{commit}_{iteration:04d}.log"
 
-        CON.rule(f"[bold cyan]iteration {iteration}  |  {commit}[/]")
+        CON.rule(f"[bold cyan]iteration {iteration}/{bound}  |  {commit}[/]")
 
-        # ── build full prompt: agent instructions + user prompt ──
+        # ── build full prompt: agent instructions + user prompt + iteration ctx ──
         agent_prompt = _read_agent_prompt(cfg)
-        full_prompt = f"{agent_prompt}\n\n---\n\nUSER TASK:\n{prompt}"
+        full_prompt = (
+            f"{agent_prompt}\n\n---\n\n"
+            f"USER TASK:\n{prompt}\n\n"
+            f"---\n"
+            f"ITERATION: {iteration} of {bound}\n"
+            f"INSTRUCTION: On iteration 1, orient and plan. On subsequent iterations,\n"
+            f"build on your previous analysis — go deeper, refine, or tackle the next piece.\n"
+            f"Do NOT repeat yourself. Each iteration must add new value.\n"
+        )
 
         try:
             result = await llm(full_prompt, cfg)
@@ -260,8 +346,9 @@ async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> None:
             CON.print(f"[bold red]error: {e}[/]")
             _write_log(logfile, full_prompt, f"ERROR: {e}")
 
-        # ── cooldown before next iteration ──
-        if cfg.LOOP_COOLDOWN > 0:
+        # ── cooldown before next iteration (skip on last) ──
+        last = cfg.MAX_ITERATIONS > 0 and iteration >= cfg.MAX_ITERATIONS
+        if cfg.LOOP_COOLDOWN > 0 and not last:
             CON.print(f"[dim]sleeping {cfg.LOOP_COOLDOWN}s…[/]")
             await asyncio.sleep(cfg.LOOP_COOLDOWN)
 
@@ -301,9 +388,33 @@ async def _demo() -> None:
     CON.print(f"\n[bold cyan]Parallel wall: {wall:.2f}s  |  {len(results)} results[/]")
 
 
+def _run_example(name: str) -> None:
+    """Run a named example prompt through the ralph loop (3 iterations)."""
+    if name == "list":
+        CON.rule("[bold magenta]available example prompts[/]")
+        for n in PROMPTS.names():
+            preview = (getattr(PROMPTS, n) or "")[:80].replace("\n", " ")
+            CON.print(f"  [bold cyan]{n:<20}[/] {preview}…")
+        return
+
+    prompt = PROMPTS.get(name)
+    if not prompt:
+        CON.print(f"[bold red]unknown example:[/] {name}")
+        CON.print(f"[dim]available: {', '.join(PROMPTS.names())}[/]")
+        sys.exit(1)
+
+    CON.print(f"[bold green]running example:[/] {name} (3 iterations)\n")
+    cfg = CONFIG(MAX_ITERATIONS=3, LOOP_COOLDOWN=0.5)
+    asyncio.run(ralph_loop(prompt, cfg))
+
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        # CLI arg = prompt → ralph loop
+    if len(sys.argv) > 1 and sys.argv[1] == "--example":
+        # --example <name> → bounded ralph loop with example prompt
+        name = sys.argv[2] if len(sys.argv) > 2 else "list"
+        _run_example(name)
+    elif len(sys.argv) > 1:
+        # CLI arg = prompt → ralph loop (infinite unless MAX_ITERATIONS set)
         asyncio.run(ralph_loop(" ".join(sys.argv[1:])))
     else:
         # no args → smoke test
