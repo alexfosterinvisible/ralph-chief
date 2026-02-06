@@ -22,8 +22,9 @@ Requirements:
 ☑️ R11: PROMPTS class w/ example prompts (tuple format)
 ☑️ R12: MAX_ITERATIONS for bounded loop runs (0 = infinite)
 ☑️ R13: --tests runs all unit + integration tests in-file
+☑️ R14: <progress> tag parsing with regex, retry on failure
+☑️ R15: PROGRESS carried between iterations as prompt injection
 ⛔ Tool-use / function-calling
-⛔ Multi-turn memory (stateless per call)
 """
 # /// script
 # requires-python = ">=3.12"
@@ -36,14 +37,14 @@ Requirements:
 
 import asyncio
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-
-import tempfile
 
 from openai import AsyncOpenAI, RateLimitError, APIStatusError
 from rich.console import Console
@@ -86,32 +87,36 @@ class CONFIG:
     AGENT_PROMPT: str = (
         # ── role & mindset ──
         "You are a senior software engineer working autonomously in a loop.\n"
-        "Each iteration you start fresh — no memory of previous runs.\n"
-        "Your only context is this prompt, the codebase, and any files you read.\n\n"
+        "Each iteration you start fresh — your ONLY memory is the <progress> block below.\n\n"
         # ── approach: decompose → track → self-direct → persist ──
         "APPROACH:\n"
-        "1. ORIENT — Read progress files, READMEs, and recent git log to understand current state.\n"
-        "2. DECOMPOSE — Break the task into small, independently-completable pieces.\n"
-        "3. PICK ONE — Choose the highest-value next piece. Don't redo finished work.\n"
-        "4. EXECUTE — Implement it. Write code, tests, or analysis as needed.\n"
-        "5. RECORD — Update progress files so the NEXT iteration knows what you did.\n"
-        "6. NEVER STOP EARLY — Keep going until the piece is complete and verified.\n\n"
-        # ── state management (you start fresh each loop) ──
-        "STATE MANAGEMENT:\n"
-        "- Maintain a PROGRESS.md with: what's done, what's in-progress, what's next.\n"
-        "- Log errors with 'ERROR:' prefix on the same line (grep-friendly).\n"
-        "- Pre-compute summary stats instead of dumping raw output.\n"
-        "- Keep context concise — don't emit thousands of lines of noise.\n\n"
+        "1. READ the <progress> block to understand what's already done.\n"
+        "2. PICK the highest-value next piece. Don't redo finished work.\n"
+        "3. EXECUTE — produce your analysis, code, or output.\n"
+        "4. UPDATE the <progress> block at the END of your response (MANDATORY).\n\n"
+        # ── CRITICAL: progress tag format ──
+        "PROGRESS TAG (MANDATORY — your response MUST end with this):\n"
+        "You MUST include exactly one <progress> tag at the end of your response.\n"
+        "This is your ONLY way to pass state to the next iteration.\n"
+        "Format:\n"
+        "<progress>\n"
+        "DONE: bullet list of completed items\n"
+        "CURRENT: what you worked on this iteration\n"
+        "NEXT: what the next iteration should focus on\n"
+        "BLOCKERS: any issues (or 'none')\n"
+        "</progress>\n\n"
         # ── quality ──
-        "QUALITY:\n"
-        "- Each change should be small, correct, and tested before moving on.\n"
-        "- Don't break existing functionality — verify before and after.\n"
-        "- If stuck, document what you tried and why it failed, then move on.\n"
+        "RULES:\n"
+        "- Each iteration must add new value — do NOT repeat previous work.\n"
+        "- Keep the <progress> block concise (under 500 chars).\n"
+        "- If stuck, note what you tried and move on.\n"
+        "- Log errors with 'ERROR:' prefix (grep-friendly).\n"
     )
     AGENT_PROMPT_FILE: str = "AGENT_PROMPT.md"  # overrides AGENT_PROMPT if exists
     AGENT_LOGS_DIR: str = "agent_logs"
     LOOP_COOLDOWN: float = 1.0        # seconds between iterations
     MAX_ITERATIONS: int = 0           # 0 = infinite, >0 = bounded
+    PROGRESS_RETRIES: int = 2         # re-run if <progress> parse fails
 
 
 CFG = CONFIG()
@@ -265,6 +270,17 @@ async def llm(prompt: str, cfg: CONFIG = CFG) -> str:
     return await _call(prompt, cfg)
 
 
+# ─────────────── PROGRESS PARSER ─────────────────────────────
+
+_PROGRESS_RE = re.compile(r"<progress>(.*?)</progress>", re.DOTALL | re.IGNORECASE)
+
+
+def _parse_progress(text: str) -> str | None:
+    """Extract content between <progress>...</progress> tags. None if missing."""
+    m = _PROGRESS_RE.search(text)
+    return m.group(1).strip() if m else None
+
+
 # ─────────────── RALPH LOOP ──────────────────────────────────
 
 def _git_short(n: int = 6) -> str:
@@ -300,19 +316,23 @@ def _write_log(logfile: Path, prompt: str, result: str) -> None:
     CON.print(f"[dim]logged → {logfile.resolve()}[/]")
 
 
-async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> None:
-    """The ralph loop — while-true, fresh context each iteration.
+async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> str:
+    """The ralph loop — while-true, carries <progress> between iterations.
 
-    Pattern from anthropic.com/engineering/building-c-compiler:
-    each iteration reads agent prompt fresh, gets git commit,
-    calls LLM, logs output, repeats.
+    Since oss120b has no tool-use, the LLM outputs <progress>...</progress>
+    tags. The harness parses them and injects the accumulated progress into
+    the next iteration's prompt. If parse fails, re-runs the same step.
+
+    Returns the final progress string.
     """
     bound = f"max {cfg.MAX_ITERATIONS}" if cfg.MAX_ITERATIONS > 0 else "infinite"
     CON.rule("[bold magenta]ralph loop — oss120b (no tool-use)[/]")
     CON.print(f"[bold yellow]user prompt:[/] {prompt}")
     CON.print(f"[dim]cooldown: {cfg.LOOP_COOLDOWN}s  |  iterations: {bound}  |  logs: {cfg.AGENT_LOGS_DIR}/[/]\n")
 
+    progress: str = "DONE: nothing yet\nCURRENT: starting\nNEXT: orient and plan\nBLOCKERS: none"
     iteration = 0
+
     while True:
         iteration += 1
         if cfg.MAX_ITERATIONS > 0 and iteration > cfg.MAX_ITERATIONS:
@@ -323,33 +343,54 @@ async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> None:
         logfile = Path(cfg.AGENT_LOGS_DIR) / f"agent_{commit}_{iteration:04d}.log"
 
         CON.rule(f"[bold cyan]iteration {iteration}/{bound}  |  {commit}[/]")
+        CON.print(f"[dim]progress in:[/] {progress[:200]}{'…' if len(progress)>200 else ''}")
 
-        # ── build full prompt: agent instructions + user prompt + iteration ctx ──
+        # ── build prompt: agent instructions + progress + user task ──
         agent_prompt = _read_agent_prompt(cfg)
         full_prompt = (
             f"{agent_prompt}\n\n---\n\n"
+            f"PREVIOUS PROGRESS (from last iteration):\n"
+            f"<progress>\n{progress}\n</progress>\n\n"
+            f"---\n\n"
             f"USER TASK:\n{prompt}\n\n"
             f"---\n"
             f"ITERATION: {iteration} of {bound}\n"
-            f"INSTRUCTION: On iteration 1, orient and plan. On subsequent iterations,\n"
-            f"build on your previous analysis — go deeper, refine, or tackle the next piece.\n"
-            f"Do NOT repeat yourself. Each iteration must add new value.\n"
         )
 
-        try:
-            result = await llm(full_prompt, cfg)
-            _write_log(logfile, full_prompt, result)
-        except KeyboardInterrupt:
-            raise
-        except Exception as e:
-            CON.print(f"[bold red]error: {e}[/]")
-            _write_log(logfile, full_prompt, f"ERROR: {e}")
+        # ── call LLM with retry on missing <progress> tag ──
+        parsed: str | None = None
+        for attempt in range(1 + cfg.PROGRESS_RETRIES):
+            try:
+                if attempt > 0:
+                    CON.print(f"[bold yellow]retry {attempt}/{cfg.PROGRESS_RETRIES} — <progress> tag missing, re-running…[/]")
+                result = await llm(full_prompt, cfg)
+                _write_log(logfile, full_prompt, result)
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                CON.print(f"[bold red]error: {e}[/]")
+                _write_log(logfile, full_prompt, f"ERROR: {e}")
+                break
 
-        # ── cooldown before next iteration (skip on last) ──
+            parsed = _parse_progress(result)
+            if parsed is not None:
+                break
+            CON.print("[bold yellow]⚠ no <progress> tag found in response[/]")
+
+        # ── update progress for next iteration ──
+        if parsed:
+            progress = parsed
+            CON.print(f"[bold green]progress out:[/] {progress[:200]}{'…' if len(progress)>200 else ''}")
+        else:
+            CON.print("[bold red]<progress> parse failed after retries — keeping previous progress[/]")
+
+        # ── cooldown (skip on last) ──
         last = cfg.MAX_ITERATIONS > 0 and iteration >= cfg.MAX_ITERATIONS
         if cfg.LOOP_COOLDOWN > 0 and not last:
             CON.print(f"[dim]sleeping {cfg.LOOP_COOLDOWN}s…[/]")
             await asyncio.sleep(cfg.LOOP_COOLDOWN)
+
+    return progress
 
 
 # ─────────────── TESTS ───────────────────────────────────────
@@ -419,7 +460,7 @@ def _test_read_agent_prompt_inline() -> None:
     """R10: _read_agent_prompt falls back to CONFIG.AGENT_PROMPT."""
     cfg = CONFIG(AGENT_PROMPT_FILE="__nonexistent_file__.md")
     result = _read_agent_prompt(cfg)
-    _t("fallback to inline AGENT_PROMPT", "ORIENT" in result and len(result) > 100, f"{len(result)} chars")
+    _t("fallback to inline AGENT_PROMPT", "<progress>" in result and len(result) > 100, f"{len(result)} chars")
 
 
 def _test_read_agent_prompt_file() -> None:
@@ -459,7 +500,6 @@ def _test_semaphore_lazy_init() -> None:
 
 def _test_iteration_context() -> None:
     """R12: iteration context string is injected correctly."""
-    # simulate what ralph_loop builds
     cfg = CONFIG(MAX_ITERATIONS=5)
     bound = f"max {cfg.MAX_ITERATIONS}" if cfg.MAX_ITERATIONS > 0 else "infinite"
     ctx = f"ITERATION: 3 of {bound}\n"
@@ -468,6 +508,54 @@ def _test_iteration_context() -> None:
     bound2 = f"max {cfg2.MAX_ITERATIONS}" if cfg2.MAX_ITERATIONS > 0 else "infinite"
     ctx2 = f"ITERATION: 1 of {bound2}\n"
     _t("infinite mode says 'infinite'", "infinite" in ctx2)
+
+
+def _test_parse_progress() -> None:
+    """R14: _parse_progress extracts <progress> content correctly."""
+    # ── basic extraction ──
+    text = "Here is my analysis.\n<progress>\nDONE: item1\nNEXT: item2\n</progress>"
+    result = _parse_progress(text)
+    _t("basic parse extracts content", result is not None and "DONE: item1" in result)
+
+    # ── case insensitive ──
+    text2 = "stuff\n<PROGRESS>\nDONE: x\n</PROGRESS>\nmore stuff"
+    _t("case insensitive parse", _parse_progress(text2) is not None)
+
+    # ── multiline with full structure ──
+    text3 = (
+        "Long analysis here...\n"
+        "<progress>\n"
+        "DONE: reviewed config, identified 3 smells\n"
+        "CURRENT: writing diffs for smell #1\n"
+        "NEXT: tackle smell #2\n"
+        "BLOCKERS: none\n"
+        "</progress>\n"
+    )
+    p = _parse_progress(text3)
+    _t("multiline parse", p is not None)
+    _t("multiline has DONE", p is not None and "DONE:" in p)
+    _t("multiline has CURRENT", p is not None and "CURRENT:" in p)
+    _t("multiline has NEXT", p is not None and "NEXT:" in p)
+    _t("multiline has BLOCKERS", p is not None and "BLOCKERS:" in p)
+
+    # ── no tag → None ──
+    _t("missing tag returns None", _parse_progress("no tags here") is None)
+    _t("empty string returns None", _parse_progress("") is None)
+
+    # ── empty tag ──
+    _t("empty tag returns empty str", _parse_progress("<progress></progress>") == "")
+
+    # ── tag with extra whitespace ──
+    p2 = _parse_progress("<progress>\n  \n  DONE: x  \n  \n</progress>")
+    _t("whitespace stripped", p2 is not None and p2.startswith("DONE:"))
+
+
+def _test_config_progress_retries() -> None:
+    """R14: PROGRESS_RETRIES field exists and defaults to 2."""
+    c = CONFIG()
+    _t("PROGRESS_RETRIES default 2", c.PROGRESS_RETRIES == 2)
+    c2 = CONFIG(PROGRESS_RETRIES=5)
+    _t("PROGRESS_RETRIES override", c2.PROGRESS_RETRIES == 5)
 
 
 # ─── integration tests (API calls) ───────────────────────────
@@ -506,13 +594,19 @@ async def _test_llm_parallel() -> None:
 
 
 async def _test_ralph_loop_bounded() -> None:
-    """R9,R12: ralph_loop stops at MAX_ITERATIONS."""
-    cfg = CONFIG(MAX_ITERATIONS=1, LOOP_COOLDOWN=0, MAX_TOKENS=128)
+    """R9,R12,R14,R15: ralph_loop stops at MAX_ITERATIONS, carries progress."""
+    cfg = CONFIG(MAX_ITERATIONS=2, LOOP_COOLDOWN=0, MAX_TOKENS=512)
     t0 = time.perf_counter()
-    await ralph_loop("Say 'iteration test passed'.", cfg)
+    final_progress = await ralph_loop(
+        "Count to 3, one number per iteration. "
+        "In your <progress> tag, list which numbers you've said so far under DONE.",
+        cfg,
+    )
     wall = time.perf_counter() - t0
     _t("bounded loop completes", True, f"{wall:.2f}s")
-    _t("bounded loop < 15s", wall < 15, f"{wall:.2f}s")
+    _t("bounded loop < 30s", wall < 30, f"{wall:.2f}s")
+    _t("final progress is string", isinstance(final_progress, str))
+    _t("final progress non-empty", len(final_progress) > 5, f"{len(final_progress)} chars")
 
 
 # ─── test runner ──────────────────────────────────────────────
@@ -533,6 +627,8 @@ async def _run_tests() -> None:
     _test_write_log()
     _test_semaphore_lazy_init()
     _test_iteration_context()
+    _test_parse_progress()
+    _test_config_progress_retries()
 
     CON.rule("[bold magenta]INTEGRATION TESTS (API calls)[/]")
     await _test_llm_joke()
