@@ -989,6 +989,21 @@ def _test_build_analysis_prompt() -> None:
     _t("analysis prompt asks for score", "score" in p.lower() or "rate" in p.lower())
 
 
+def _test_tmux_split_graceful_degradation() -> None:
+    """R8.4: _run_all_tmux degrades gracefully when tmux can't split (no crash)."""
+    # Simulate what happens when split-window fails by checking the function
+    # handles CalledProcessError from split-window without raising.
+    # We can't run actual tmux in CI, but we verify the code path exists
+    # by inspecting that _run_all_tmux catches returncode != 0 on split.
+    import inspect
+    src = inspect.getsource(_run_all_tmux)
+    _t("tmux split checks returncode", "r.returncode" in src or "returncode != 0" in src)
+    _t("tmux split has break on failure", "break" in src)
+    _t("tmux split uses capture_output", "capture_output=True" in src)
+    _t("tmux split no check=True on split", 'check=True' not in src.split("split-window")[1].split("send-keys")[0],
+       "split-window call must not use check=True")
+
+
 # ─── integration tests (API calls) ───────────────────────────
 
 async def _test_llm_joke() -> None:
@@ -1075,6 +1090,7 @@ async def _run_tests() -> None:
     _test_format_thread_entry()
     _test_format_summary()
     _test_build_analysis_prompt()
+    _test_tmux_split_graceful_degradation()
 
     CON.rule("[bold magenta]INTEGRATION TESTS (API calls)[/]")
     await _test_llm_joke()
@@ -1410,17 +1426,27 @@ def _run_all_tmux() -> None:
     ]:
         subprocess.run(["tmux"] + opt, capture_output=True)
 
-    # create all panes first (one already exists from new-session)
+    # create panes — one already exists from new-session.
+    # tmux may refuse splits if terminal is too small ("no space for new pane").
+    pane_count = 1
     for _ in names[1:]:
-        subprocess.run([
-            "tmux", "split-window", "-t", session,
-        ], check=True)
+        r = subprocess.run(
+            ["tmux", "split-window", "-t", session],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            CON.print(f"[bold yellow]tmux: could only create {pane_count}/{len(names)} panes "
+                      f"(terminal too small?) — running {pane_count} examples[/]")
+            break
+        pane_count += 1
+        # rebalance after each split so next split has room
+        subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], capture_output=True)
 
-    # single layout pass — no per-split rebalancing
-    subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], check=True)
+    # final layout pass
+    subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], capture_output=True)
 
-    # now send commands to each pane with staggered starts
-    for i, n in enumerate(names):
+    # send commands to each pane (only as many as we created)
+    for i, n in enumerate(names[:pane_count]):
         delay = f"sleep {i * 0.3:.1f} && " if i > 0 else ""
         subprocess.run([
             "tmux", "send-keys", "-t", f"{session}:{0}.{i}",
