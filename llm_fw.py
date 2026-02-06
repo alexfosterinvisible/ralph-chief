@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Fireworks oss120b LLM caller — no tool-use, raw completions.
+"""Fireworks oss120b LLM caller + ralph loop — no tool-use.
+
+Usage:
+    uv run llm_fw.py "your prompt here"   # ralph loop (while-true)
+    uv run llm_fw.py                      # smoke-test demo
 
 Requirements:
 ☑️ R1: Call gpt-oss-120b on Fireworks via OpenAI-compatible API
@@ -10,6 +14,8 @@ Requirements:
 ☑️ R6: tenacity exp-backoff retries up to 3
 ☑️ R7: Rich prints w/ color for everything
 ☑️ R8: Streaming for fast TTFT
+☑️ R9: ralph_loop(prompt) — while-true loop, logs per-commit
+☑️ R10: AGENT_PROMPT in CONFIG, read fresh each iteration
 ⛔ Tool-use / function-calling
 ⛔ Multi-turn memory (stateless per call)
 """
@@ -24,9 +30,12 @@ Requirements:
 
 import asyncio
 import os
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
 
 from openai import AsyncOpenAI, RateLimitError, APIStatusError
 from rich.console import Console
@@ -37,7 +46,6 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
     retry_if_exception_type,
-    before_sleep_log,
 )
 
 # ─────────────────────────── CONFIG ───────────────────────────
@@ -65,6 +73,17 @@ class CONFIG:
     MAX_RETRIES: int = 3
     BACKOFF_MIN: float = 1.0          # seconds
     BACKOFF_MAX: float = 8.0          # seconds
+
+    # ── ralph loop ──
+    AGENT_PROMPT: str = (
+        "You are a senior software engineer working autonomously.\n"
+        "Review the current state of the codebase, decide what to work on next,\n"
+        "and provide your analysis, plan, and any code changes.\n"
+        "Be specific and actionable."
+    )
+    AGENT_PROMPT_FILE: str = "AGENT_PROMPT.md"  # overrides AGENT_PROMPT if exists
+    AGENT_LOGS_DIR: str = "agent_logs"
+    LOOP_COOLDOWN: float = 1.0        # seconds between iterations
 
 
 CFG = CONFIG()
@@ -149,6 +168,79 @@ async def llm(prompt: str, cfg: CONFIG = CFG) -> str:
     return await _call(prompt, cfg)
 
 
+# ─────────────── RALPH LOOP ──────────────────────────────────
+
+def _git_short(n: int = 6) -> str:
+    """Current commit hash, short."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", f"--short={n}", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True,
+        ).strip()
+    except Exception:
+        return "nogit"
+
+
+def _read_agent_prompt(cfg: CONFIG) -> str:
+    """Read AGENT_PROMPT_FILE if it exists, else fall back to CONFIG.AGENT_PROMPT."""
+    p = Path(cfg.AGENT_PROMPT_FILE)
+    if p.is_file():
+        text = p.read_text().strip()
+        CON.print(f"[dim]agent prompt: {p.resolve()} ({len(text)} chars)[/]")
+        return text
+    return cfg.AGENT_PROMPT
+
+
+def _write_log(logfile: Path, prompt: str, result: str) -> None:
+    """Append iteration result to logfile."""
+    logfile.parent.mkdir(parents=True, exist_ok=True)
+    with logfile.open("a") as f:
+        f.write(f"\n{'='*72}\n")
+        f.write(f"TIME: {datetime.now().isoformat()}\n")
+        f.write(f"PROMPT ({len(prompt)} chars):\n{prompt[:500]}{'…' if len(prompt)>500 else ''}\n")
+        f.write(f"{'─'*72}\n")
+        f.write(f"RESPONSE ({len(result)} chars):\n{result}\n")
+    CON.print(f"[dim]logged → {logfile.resolve()}[/]")
+
+
+async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> None:
+    """The ralph loop — while-true, fresh context each iteration.
+
+    Pattern from anthropic.com/engineering/building-c-compiler:
+    each iteration reads agent prompt fresh, gets git commit,
+    calls LLM, logs output, repeats.
+    """
+    CON.rule("[bold magenta]ralph loop — oss120b (no tool-use)[/]")
+    CON.print(f"[bold yellow]user prompt:[/] {prompt}")
+    CON.print(f"[dim]cooldown: {cfg.LOOP_COOLDOWN}s  |  logs: {cfg.AGENT_LOGS_DIR}/[/]\n")
+
+    iteration = 0
+    while True:
+        iteration += 1
+        commit = _git_short()
+        logfile = Path(cfg.AGENT_LOGS_DIR) / f"agent_{commit}_{iteration:04d}.log"
+
+        CON.rule(f"[bold cyan]iteration {iteration}  |  {commit}[/]")
+
+        # ── build full prompt: agent instructions + user prompt ──
+        agent_prompt = _read_agent_prompt(cfg)
+        full_prompt = f"{agent_prompt}\n\n---\n\nUSER TASK:\n{prompt}"
+
+        try:
+            result = await llm(full_prompt, cfg)
+            _write_log(logfile, full_prompt, result)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            CON.print(f"[bold red]error: {e}[/]")
+            _write_log(logfile, full_prompt, f"ERROR: {e}")
+
+        # ── cooldown before next iteration ──
+        if cfg.LOOP_COOLDOWN > 0:
+            CON.print(f"[dim]sleeping {cfg.LOOP_COOLDOWN}s…[/]")
+            await asyncio.sleep(cfg.LOOP_COOLDOWN)
+
+
 # ─────────────── DEMO / GUARDMAIN ────────────────────────────
 
 async def _demo() -> None:
@@ -167,7 +259,7 @@ async def _demo() -> None:
     )
     CON.print(f"[dim]Input length: {len(big_input)} chars (~3 pages)[/]")
     t0 = time.perf_counter()
-    text = await llm(big_input)
+    await llm(big_input)
     wall = time.perf_counter() - t0
     ok = wall < 3.0
     CON.print(f"\n[bold {'green' if ok else 'yellow'}]e2e: {wall:.2f}s  |  {'PASS <3s' if ok else 'SLOW'}[/]")
@@ -185,4 +277,9 @@ async def _demo() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(_demo())
+    if len(sys.argv) > 1:
+        # CLI arg = prompt → ralph loop
+        asyncio.run(ralph_loop(" ".join(sys.argv[1:])))
+    else:
+        # no args → smoke test
+        asyncio.run(_demo())

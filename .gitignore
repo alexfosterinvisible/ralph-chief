@@ -1,21 +1,21 @@
-.codersinflow
-.vscode
-node_modules
-.env
-.venv
-.codex
-out
-dist
-*.vsix
-.claude
-CLAUDE.md
+# Wiggum playground
+bin/chief-wiggum/
+projects/
+.envrc
+
+# IDE
+.vscode/
+.cursor/
+.claude/
+.specstory/
+
+# OS
 .DS_Store
-.git
+
+# Misc
 *.log
 *.tmp
-__pycache__
-*.pyc
-.env.local
-.next
-.github
-test_proj/
+
+# OpenMemory - IDE/Assistant specific rules
+.cursor/rules/openmemory.mdc
+agent_logs/
