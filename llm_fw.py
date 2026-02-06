@@ -3,7 +3,7 @@
 
 Usage:
     uv run llm_fw.py "your prompt here"       # ralph loop
-    uv run llm_fw.py --example code_review    # run example (agent decides when done)
+    uv run llm_fw.py --example algorithm      # run example (agent decides when done)
     uv run llm_fw.py --example list           # list available examples
     uv run llm_fw.py --tests                  # run all tests (unit + integration)
     uv run llm_fw.py --eval                   # LLM-judge tenet evaluations
@@ -87,14 +87,16 @@ class CONFIG:
     # Full agent prompt — pattern from anthropic.com/engineering/building-c-compiler
     # The AGENT_PROMPT_FILE overrides this if it exists on disk.
     AGENT_PROMPT: str = (
-        # ── role & mindset ──
+        # ── role & constraints ──
         "You are a senior software engineer working autonomously in a loop.\n"
+        "You have NO tool-use — you cannot read files, run commands, or access the internet.\n"
+        "Everything you need is provided IN THIS PROMPT. Do NOT ask for more information.\n"
         "Each iteration you start fresh — your ONLY memory is the <progress> block below.\n\n"
-        # ── approach: decompose → track → self-direct → persist ──
+        # ── approach ──
         "APPROACH:\n"
         "1. READ the <progress> block to understand what's already done.\n"
         "2. PICK the highest-value next piece. Don't redo finished work.\n"
-        "3. EXECUTE — produce your analysis, code, or output.\n"
+        "3. EXECUTE — produce your analysis, code, or output using ONLY the context given.\n"
         "4. UPDATE the <progress> block at the END of your response (MANDATORY).\n\n"
         # ── CRITICAL: progress tag format ──
         "PROGRESS TAG (MANDATORY — your response MUST end with this):\n"
@@ -114,10 +116,10 @@ class CONFIG:
         "- Do NOT stop early — only signal DONE when all sub-tasks are finished.\n\n"
         # ── quality ──
         "RULES:\n"
+        "- You have NO file access. Work only with what's in this prompt.\n"
         "- Each iteration must add new value — do NOT repeat previous work.\n"
         "- Keep the <progress> block concise (under 500 chars).\n"
         "- If stuck, note what you tried and move on.\n"
-        "- Log errors with 'ERROR:' prefix (grep-friendly).\n"
     )
     AGENT_PROMPT_FILE: str = "AGENT_PROMPT.md"  # overrides AGENT_PROMPT if exists
     AGENT_LOGS_DIR: str = "agent_logs"
@@ -136,20 +138,12 @@ CFG = CONFIG()
 class PROMPTS:
     """Example prompts that exercise the ralph loop sensibly."""
 
-    # ── code review: analyze a real file in the repo ──
-    code_review = (
-        "Review the file llm_fw.py in this repository.\n"
-        "1. List every function and its purpose (1-line each).\n"
-        "2. Identify the top 3 code smells or improvements.\n"
-        "3. For each improvement, show the exact diff you'd apply.\n"
-        "4. Rate overall code quality 1-10 with justification.\n"
-        # agent should produce structured, actionable output
-        "5. STATUS: summarize findings, suggest next iteration focus."
-    )
+    # ── All prompts are SELF-CONTAINED: no file access, no tool-use. ──
+    # ── The model must be able to complete the task using ONLY this text. ──
 
-    # ── feature design: plan a new capability ──
+    # ── feature design: plan a new capability (pure reasoning) ──
     feature_design = (
-        "Design a retry-with-circuit-breaker for the LLM caller.\n"
+        "Design a retry-with-circuit-breaker for an async Python LLM caller.\n"
         "1. Define the state machine: CLOSED → OPEN → HALF-OPEN.\n"
         "2. Specify thresholds: failure count, timeout, half-open probe.\n"
         "3. Write the Python dataclass for CircuitBreaker state.\n"
@@ -159,19 +153,36 @@ class PROMPTS:
         "6. STATUS: what's designed, what needs refinement, what's next."
     )
 
-    # ── bug hunt: find and fix a hypothetical issue ──
+    # ── bug analysis: trace a hypothetical data flow (pure reasoning) ──
     bug_hunt = (
-        "The streaming response sometimes returns empty text.\n"
-        "1. Trace the data flow: API call → stream chunks → join → return.\n"
-        "2. List every place where empty/None could leak through.\n"
-        "3. For each, propose a defensive check with exact code.\n"
-        "4. Write a test that reproduces empty-response edge case.\n"
-        "5. STATUS: root causes found, fixes proposed, confidence level."
+        "A streaming LLM API sometimes returns empty text. The code does:\n"
+        "  chunks = []\n"
+        "  async for chunk in stream:\n"
+        "    delta = chunk.choices[0].delta.content\n"
+        "    if delta: chunks.append(delta)\n"
+        "  return ''.join(chunks)\n\n"
+        "1. Trace the data flow and list every place empty/None could leak.\n"
+        "2. For each, propose a defensive check with exact code.\n"
+        "3. Write a pytest that reproduces the empty-response edge case.\n"
+        "4. STATUS: root causes found, fixes proposed, confidence level."
     )
 
-    # ── refactor: simplify existing code ──
+    # ── refactor: redesign a dataclass (code provided inline) ──
     refactor = (
-        "Refactor the CONFIG dataclass in llm_fw.py.\n"
+        "Refactor this CONFIG dataclass:\n\n"
+        "  @dataclass\n"
+        "  class CONFIG:\n"
+        "    MODEL: str = 'gpt-oss-120b'\n"
+        "    BASE_URL: str = 'https://api.fireworks.ai/inference/v1'\n"
+        "    API_KEY: str = ''  # from env\n"
+        "    MAX_TOKENS: int = 4096\n"
+        "    TEMPERATURE: float = 0.7\n"
+        "    MAX_CONCURRENT: int = 10\n"
+        "    MAX_RETRIES: int = 3\n"
+        "    BACKOFF_MIN: float = 1.0\n"
+        "    BACKOFF_MAX: float = 8.0\n"
+        "    LOOP_COOLDOWN: float = 1.0\n"
+        "    MAX_ITERATIONS: int = 0\n\n"
         "1. Group related fields into nested dataclasses (ModelCfg, RetryCfg, etc).\n"
         "2. Add validation in __post_init__ (e.g. MAX_TOKENS > 0).\n"
         "3. Add a .from_env() classmethod that loads from env vars.\n"
@@ -179,14 +190,25 @@ class PROMPTS:
         "5. STATUS: what changed, what's cleaner, backwards-compat notes."
     )
 
-    # ── architecture: design a multi-agent system ──
+    # ── architecture: design a multi-agent system (pure reasoning) ──
     architecture = (
-        "Design a parallel agent system (like anthropic.com/engineering/building-c-compiler).\n"
+        "Design a parallel agent system for autonomous coding (no tool-use required).\n"
         "1. Define the coordination protocol: task locks, git sync, conflict resolution.\n"
         "2. Sketch the Docker container setup for N parallel agents.\n"
-        "3. Define the AGENT_PROMPT.md that each agent reads.\n"
-        "4. Show the bash harness (while-true loop + git push/pull).\n"
+        "3. Write the AGENT_PROMPT.md content that each agent reads.\n"
+        "4. Write the bash harness (while-true loop + git push/pull).\n"
         "5. STATUS: architecture complete? gaps? next steps?"
+    )
+
+    # ── algorithm: implement from scratch (pure reasoning) ──
+    algorithm = (
+        "Implement a priority queue backed by a binary heap in Python.\n"
+        "1. Write the class with push, pop, peek, and __len__.\n"
+        "2. Use a list as the backing store, no heapq import.\n"
+        "3. Support (priority, item) tuples, lower priority = higher urgency.\n"
+        "4. Write 5 pytest tests covering: empty pop, ordering, duplicates, peek, len.\n"
+        "5. Analyze time complexity for each operation.\n"
+        "6. STATUS: implementation complete? tests pass? edge cases covered?"
     )
 
     @classmethod
@@ -486,7 +508,7 @@ def _test_prompts_class() -> None:
     """R11: PROMPTS has entries and lookup works."""
     names = PROMPTS.names()
     _t("PROMPTS has >=3 entries", len(names) >= 3, f"found {len(names)}")
-    _t("PROMPTS.get('code_review') returns str", isinstance(PROMPTS.get("code_review"), str))
+    _t("PROMPTS.get('feature_design') returns str", isinstance(PROMPTS.get("feature_design"), str))
     _t("PROMPTS.get('nonexistent') returns None", PROMPTS.get("nonexistent") is None)
     for n in names:
         val = PROMPTS.get(n)
