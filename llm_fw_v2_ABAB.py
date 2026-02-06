@@ -1081,42 +1081,47 @@ async def _run_tests() -> None:
 # ─────────────── EXAMPLE RUNNER / TMUX ────────────────────────
 
 def _run_all_tmux() -> None:
-    """Launch all examples in a tmux pane grid, one per pane, in parallel.
+    """Launch all examples in separate tmux windows (one per example).
 
-    Optimizations: create all panes FIRST, layout ONCE, stagger starts,
-    remain-on-exit, minimal status bar.
+    Uses windows (tabs) instead of panes to avoid 'no space for new pane'
+    when terminal is too small for 8 splits. Each example gets a full-size
+    terminal. Navigate: Ctrl-b n (next) / Ctrl-b p (prev).
+    Stagger starts 0.3s apart to avoid rate-limit burst.
     """
     names = PROMPTS.names()
     session = "ralph-v2-all"
     script = os.path.abspath(__file__)
 
     subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
+
+    # create session — first window named after first example
     subprocess.run([
-        "tmux", "new-session", "-d", "-s", session, "-x", "220", "-y", "60",
+        "tmux", "new-session", "-d", "-s", session, "-n", names[0],
     ], check=True)
-    for opt in [
-        ["set-option", "-t", session, "remain-on-exit", "on"],
-        ["set-option", "-t", session, "status", "off"],
-    ]:
-        subprocess.run(["tmux"] + opt, capture_output=True)
+    subprocess.run(
+        ["tmux", "set-option", "-t", session, "remain-on-exit", "on"],
+        capture_output=True,
+    )
 
-    # create all panes first (one already exists)
-    for _ in names[1:]:
-        subprocess.run(["tmux", "split-window", "-t", session], check=True)
+    # create a new window for each remaining example
+    for n in names[1:]:
+        subprocess.run([
+            "tmux", "new-window", "-t", session, "-n", n,
+        ], check=True)
 
-    # single layout pass
-    subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], check=True)
-
-    # send staggered commands to each pane
+    # send staggered commands to each window
     for i, n in enumerate(names):
         delay = f"sleep {i * 0.3:.1f} && " if i > 0 else ""
         subprocess.run([
-            "tmux", "send-keys", "-t", f"{session}:{0}.{i}",
+            "tmux", "send-keys", "-t", f"{session}:{n}",
             f"{delay}uv run {script} --example {n}", "Enter",
         ], check=True)
 
+    # select first window
+    subprocess.run(["tmux", "select-window", "-t", f"{session}:{names[0]}"], capture_output=True)
+
     CON.print(f"[bold green]launched {len(names)} examples in tmux session '{session}'[/]")
-    CON.print(f"[dim]attach: tmux attach -t {session}  |  kill: tmux kill-session -t {session}[/]")
+    CON.print(f"[dim]attach: tmux attach -t {session}  |  Ctrl-b n/p to switch  |  kill: tmux kill-session -t {session}[/]")
     if sys.stdout.isatty():
         os.execvp("tmux", ["tmux", "attach", "-t", session])
     else:
