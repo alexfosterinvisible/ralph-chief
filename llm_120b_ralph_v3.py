@@ -7,6 +7,9 @@
   v3 (this file)          = Both architectures in one file. Shared infra deduplicated.
                             ABAB gets LoopResult, thread accumulation, eval framework.
                             CONFIG per-step bug fixed (replace() instead of fresh CONFIG()).
+                            _ARTIFACT_RE handles unquoted name=foo attrs.
+                            ABAB judge retries on unparseable output (PROGRESS_RETRIES).
+                            ABAB evals: 4 programmatic + 3 LLM-judge + 1 thread = 8 (matches AAAA).
 
 Usage:
     uv run llm_120b_ralph_v3.py "task here"                  # ABAB (default)
@@ -47,15 +50,17 @@ Requirements:
 
 ── ABAB (generator-verifier loop) ──
 ☑️✅🧪 R9: parse_artifacts, parse_scratchpad, parse_promise
+  ☑️✅🧪 R9.1: _ARTIFACT_RE handles unquoted name=foo (LLMs sometimes omit quotes)
 ☑️✅🧪 R10: parse_requirements, parse_tests, parse_rubric (Req/Test/Score)
-☑️✅ R11: R→A→B→prog architecture with stall detection
-☑️✅ R12: ABLoopResult + thread + Rich summary (NEW in v3)
-☑️✅ R13: AB_TENETS (5 criteria) + _build_ab_analysis_prompt (NEW in v3)
+☑️✅🧪 R11: R→A→B→prog architecture with stall detection + judge retry
+☑️✅🧪 R12: ABLoopResult + thread + Rich summary (NEW in v3)
+☑️✅🧪 R13: AB_TENETS (5 criteria) + _build_ab_analysis_prompt (NEW in v3)
 
 ── EVALS ──
 ☑️✅🧪 R14: AAAA programmatic evals (concise, structured, no_bleed, summary)
 ☑️✅🧪 R15: AAAA LLM-judge evals (incremental_value, forward_motion, no_echo)
-☑️✅ R16: ABAB evals (score_progression, artifacts_present, thread analysis)
+☑️✅🧪 R16: ABAB programmatic evals (score_progression, artifacts_present, req_coverage, final_score)
+☑️✅ R16.1: ABAB LLM-judge evals (worker_addresses_failures, judge_strictness, thread_analysis)
 
 ── CLI ──
 ☑️✅ R17: --mode aaaa|abab, --tests, --eval, --example, --kill
@@ -647,12 +652,16 @@ async def ralph_loop_aaaa(prompt: str, cfg: CONFIG = CFG) -> LoopResult:
 # TDD: tests written first, then these implementations.
 
 _ARTIFACT_RE = re.compile(
-    r'<artifact\s+name=["\']([^"\']+)["\']\s*>(.*?)</artifact>',
+    r'<artifact\s+name=["\']?([^"\'>\s]+)["\']?\s*>(.*?)</artifact>',
     re.DOTALL | re.IGNORECASE,
 )
 
 def parse_artifacts(text: str) -> dict[str, str]:
-    """Extract all <artifact name="...">...</artifact> blocks."""
+    """Extract all <artifact name="...">...</artifact> blocks.
+
+    Handles quoted ("name" or 'name') AND unquoted (name=foo) attrs,
+    since LLMs sometimes omit quotes.
+    """
     return {m.group(1): m.group(2).strip() for m in _ARTIFACT_RE.finditer(text)}
 
 
@@ -996,7 +1005,7 @@ async def ralph_loop_abab(task: str, cfg: CONFIG = CFG) -> ABLoopResult:
         if promise:
             CON.print(f"[bold]promise:[/] {promise[:200]}{'…' if len(promise)>200 else ''}")
 
-        # ── B: JUDGE ──
+        # ── B: JUDGE (with retry on unparseable output) ──
         CON.rule(f"[bold cyan]B: JUDGE — iteration {iteration}/{cfg.MAX_ITERATIONS}[/]")
 
         judge_prompt = (
@@ -1013,22 +1022,27 @@ async def ralph_loop_abab(task: str, cfg: CONFIG = CFG) -> ABLoopResult:
         )
 
         judge_cfg = replace(cfg, MAX_TOKENS=1024, TEMPERATURE=0.0)  # FIX: inherits API_KEY
-        judge_raw = await llm(judge_prompt, judge_cfg)
-        _write_log(logfile, f"B-STEP-{iteration}", judge_prompt, judge_raw)
+        scores: list[Score] = []
+        for judge_attempt in range(1 + cfg.PROGRESS_RETRIES):
+            if judge_attempt > 0:
+                CON.print(f"[bold yellow]judge retry {judge_attempt}/{cfg.PROGRESS_RETRIES} — unparseable output[/]")
+            judge_raw = await llm(judge_prompt, judge_cfg)
+            _write_log(logfile, f"B-STEP-{iteration}.{judge_attempt}", judge_prompt, judge_raw)
+            scores = parse_rubric(judge_raw)
+            if scores:
+                break
 
-        # ── PROG: parse scores ──
-        scores = parse_rubric(judge_raw)
         final_scores = scores
         iter_elapsed = time.perf_counter() - iter_t0
 
         if not scores:
-            CON.print("[bold red]judge returned no parseable scores — retrying next iteration[/]")
+            CON.print("[bold red]judge unparseable after retries — skipping to next iteration[/]")
             failures_str = "judge output was unparseable — re-do your work and try again"
             score_history.append(0.0)
             thread.append(
                 f"── ITERATION {iteration} ({iter_elapsed:.1f}s) — JUDGE UNPARSEABLE ──\n"
                 f"WORKER: {len(worker_raw)} chars, {len(new_artifacts)} artifacts\n"
-                f"JUDGE: unparseable\n"
+                f"JUDGE: unparseable after {1 + cfg.PROGRESS_RETRIES} attempts\n"
             )
             continue
 
@@ -1287,6 +1301,60 @@ def _eval_ab_artifacts_present(result: ABLoopResult) -> tuple[bool, str]:
     return (True, f"{len(result.artifacts)} artifacts: {', '.join(result.artifacts.keys())}")
 
 
+def _eval_ab_requirements_coverage(result: ABLoopResult) -> tuple[bool, str]:
+    """Final scores should cover all extracted requirements."""
+    if not result.final_scores or not result.requirements:
+        return (True, "no scores or requirements to check")
+    scored_ids = {s.id for s in result.final_scores}
+    req_ids = {r.id for r in result.requirements}
+    missing = req_ids - scored_ids
+    if missing:
+        return (False, f"requirements not scored by judge: {', '.join(sorted(missing))}")
+    return (True, f"all {len(req_ids)} requirements scored")
+
+
+def _eval_ab_final_score_above_threshold(result: ABLoopResult, threshold: float = 40.0) -> tuple[bool, str]:
+    """Final score should be above a minimum threshold after iterations."""
+    if not result.score_history:
+        return (False, "no score history")
+    final = result.score_history[-1]
+    if final < threshold:
+        return (False, f"final score {final:.0f}% below minimum {threshold:.0f}%")
+    return (True, f"final score {final:.0f}% (threshold {threshold:.0f}%)")
+
+
+# ─────────────── ABAB LLM judge evals ────────────────────────
+
+async def _eval_ab_worker_addresses_failures(result: ABLoopResult, cfg: CONFIG) -> tuple[bool, str]:
+    """Worker should fix specific issues identified by judge between iterations."""
+    if len(result.thread) < 2:
+        return (True, "only 1 iteration, skip check")
+    thread_text = "\n\n".join(result.thread)
+    prompt = _eval_judge_prompt(
+        "worker_addresses_failures",
+        "Between iterations, the worker should address specific failures identified by the judge. "
+        "If the same failures persist across multiple iterations without the worker attempting to fix them, that's a FAIL. "
+        "Minor regressions are OK if the worker clearly tried to fix the flagged issues.",
+        thread_text,
+    )
+    return await _judge_with_retry(prompt, cfg)
+
+
+async def _eval_ab_judge_strictness(result: ABLoopResult, cfg: CONFIG) -> tuple[bool, str]:
+    """Judge should be strict — not rubber-stamping everything as PASS on first try."""
+    if not result.score_history:
+        return (True, "no scores to check")
+    thread_text = "\n\n".join(result.thread)
+    prompt = _eval_judge_prompt(
+        "judge_strictness",
+        "The judge should be appropriately strict. If the first iteration scores 100% on a non-trivial task, "
+        "that suggests rubber-stamping. The judge should identify real issues and require fixes. "
+        "A good judge gives detailed, specific reasons for FAIL scores.",
+        thread_text,
+    )
+    return await _judge_with_retry(prompt, cfg)
+
+
 async def _eval_ab_thread_analysis(result: ABLoopResult, cfg: CONFIG) -> tuple[bool, str]:
     """Final LLM analysis of ABAB thread. Passes if overall >= 3/5."""
     prompt = _build_ab_analysis_prompt(result)
@@ -1392,6 +1460,17 @@ async def _run_evals_abab() -> None:
     _ev("score_progression: no regression > 20%", ok, reason)
     ok, reason = _eval_ab_artifacts_present(result)
     _ev("artifacts_present: at least one artifact", ok, reason)
+    ok, reason = _eval_ab_requirements_coverage(result)
+    _ev("requirements_coverage: all reqs scored by judge", ok, reason)
+    ok, reason = _eval_ab_final_score_above_threshold(result)
+    _ev("final_score: above 40% threshold", ok, reason)
+
+    CON.rule("[bold magenta]EVAL: LLM judge checks[/]")
+    judge_cfg = replace(CFG, MAX_TOKENS=256, TEMPERATURE=0.0)
+    ok, reason = await _eval_ab_worker_addresses_failures(result, judge_cfg)
+    _ev("worker_addresses_failures: worker fixes judge-flagged issues", ok, reason)
+    ok, reason = await _eval_ab_judge_strictness(result, judge_cfg)
+    _ev("judge_strictness: judge not rubber-stamping", ok, reason)
 
     CON.rule("[bold magenta]EVAL: thread analysis[/]")
     analysis_cfg = replace(CFG, MAX_TOKENS=1024, TEMPERATURE=0.0)
@@ -1677,6 +1756,12 @@ def _test_parse_artifacts() -> None:
     text5 = '<artifact name="f.py">v1</artifact>\n<artifact name="f.py">v2</artifact>\n'
     _t("last artifact wins", parse_artifacts(text5).get("f.py") == "v2")
 
+    # ── unquoted name (LLMs sometimes omit quotes) ──
+    text6 = "<artifact name=utils.py>def helper(): pass</artifact>"
+    arts6 = parse_artifacts(text6)
+    _t("unquoted name works", "utils.py" in arts6)
+    _t("unquoted name content", "def helper" in arts6.get("utils.py", ""))
+
 
 def _test_parse_scratchpad() -> None:
     """parse_scratchpad extracts scratchpad content."""
@@ -1805,6 +1890,69 @@ def _test_format_ab_summary() -> None:
     s = buf.getvalue()
     _t("ab summary has iterations", "2" in s)
     _t("ab summary has 100%", "100%" in s)
+
+
+def _test_ab_tenets_defined() -> None:
+    """AB_TENETS is a non-empty string with all 5 criteria."""
+    _t("AB_TENETS is str", isinstance(AB_TENETS, str))
+    for keyword in ["SCORE PROGRESSION", "FAILURE ADDRESSING", "ARTIFACT QUALITY",
+                     "EFFICIENCY", "JUDGE STRICTNESS"]:
+        _t(f"ab tenets contains '{keyword}'", keyword in AB_TENETS)
+
+
+def _test_ab_build_analysis_prompt() -> None:
+    """_build_ab_analysis_prompt includes thread + criteria."""
+    r = ABLoopResult(
+        iterations=2, total_time=5.0, final_scores=[], artifacts={"kv.py": "code"},
+        requirements=[Req("R1", "test")], tests=[], thread=["iter1 data", "iter2 data"],
+        score_history=[60.0, 100.0], done=True, stalled=False, prompt="test", best_pct=100.0,
+    )
+    p = _build_ab_analysis_prompt(r)
+    _t("ab analysis prompt is str", isinstance(p, str))
+    _t("ab analysis prompt has <thread>", "<thread>" in p)
+    _t("ab analysis prompt has thread content", "iter1 data" in p)
+    _t("ab analysis prompt has <criteria>", "<criteria>" in p)
+    _t("ab analysis prompt has tenet content", "SCORE PROGRESSION" in p)
+    _t("ab analysis prompt asks for score", "score" in p.lower())
+
+
+def _test_eval_ab_requirements_coverage() -> None:
+    """ABAB requirements_coverage eval check."""
+    good = ABLoopResult(
+        iterations=1, total_time=1.0, artifacts={},
+        final_scores=[Score("R1", True, "ok"), Score("R2", True, "ok")],
+        requirements=[Req("R1", "test"), Req("R2", "test")], tests=[],
+        thread=[], score_history=[100.0], done=True, stalled=False, prompt="", best_pct=100.0,
+    )
+    ok, _ = _eval_ab_requirements_coverage(good)
+    _t("ab req coverage all scored passes", ok)
+    bad = ABLoopResult(
+        iterations=1, total_time=1.0, artifacts={},
+        final_scores=[Score("R1", True, "ok")],
+        requirements=[Req("R1", "test"), Req("R2", "test")], tests=[],
+        thread=[], score_history=[50.0], done=False, stalled=False, prompt="", best_pct=50.0,
+    )
+    ok2, reason2 = _eval_ab_requirements_coverage(bad)
+    _t("ab req coverage missing R2 fails", not ok2)
+    _t("ab req coverage mentions R2", "R2" in reason2)
+
+
+def _test_eval_ab_final_score_threshold() -> None:
+    """ABAB final_score threshold eval check."""
+    good = ABLoopResult(
+        iterations=2, total_time=1.0, final_scores=[], artifacts={},
+        requirements=[], tests=[], thread=[], score_history=[40.0, 60.0],
+        done=False, stalled=False, prompt="", best_pct=60.0,
+    )
+    ok, _ = _eval_ab_final_score_above_threshold(good)
+    _t("ab final score above threshold passes", ok)
+    bad = ABLoopResult(
+        iterations=2, total_time=1.0, final_scores=[], artifacts={},
+        requirements=[], tests=[], thread=[], score_history=[20.0, 30.0],
+        done=False, stalled=False, prompt="", best_pct=30.0,
+    )
+    ok2, _ = _eval_ab_final_score_above_threshold(bad)
+    _t("ab final score below threshold fails", not ok2)
 
 
 # ─── eval tests ──────────────────────────────────────────────
@@ -1965,6 +2113,25 @@ async def _test_ralph_loop_aaaa_bounded() -> None:
     _t("result.prompt preserved", "Count" in result.prompt)
 
 
+async def _test_ralph_loop_abab_bounded() -> None:
+    """ralph_loop_abab returns ABLoopResult with thread + score history."""
+    cfg = replace(CFG, MAX_ITERATIONS=2, LOOP_COOLDOWN=0, MAX_TOKENS=2048, STALL_LIMIT=3)
+    t0 = time.perf_counter()
+    result = await ralph_loop_abab(
+        "Write a Python function `add(a, b)` that returns the sum of two integers. "
+        "Include type hints and a docstring.",
+        cfg,
+    )
+    wall = time.perf_counter() - t0
+    _t("abab loop returns ABLoopResult", isinstance(result, ABLoopResult))
+    _t("abab loop < 120s", wall < 120, f"{wall:.2f}s")
+    _t("abab result.thread populated", len(result.thread) >= 1, f"{len(result.thread)} entries")
+    _t("abab result.iterations >= 1", result.iterations >= 1)
+    _t("abab result.score_history populated", len(result.score_history) >= 1, f"{result.score_history}")
+    _t("abab result.requirements extracted", len(result.requirements) >= 1, f"{len(result.requirements)} reqs")
+    _t("abab result.prompt preserved", "add" in result.prompt.lower())
+
+
 # ─── test runner ─────────────────────────────────────────────
 
 async def _run_tests() -> None:
@@ -2003,6 +2170,8 @@ async def _run_tests() -> None:
     _test_parse_full_worker_output()
     _test_ab_loop_result()
     _test_format_ab_summary()
+    _test_ab_tenets_defined()
+    _test_ab_build_analysis_prompt()
 
     CON.rule("[bold magenta]UNIT TESTS — evals[/]")
     _test_parse_verdict()
@@ -2011,6 +2180,8 @@ async def _run_tests() -> None:
     _test_eval_no_context_bleed()
     _test_eval_progress_is_summary()
     _test_eval_ab_score_progression()
+    _test_eval_ab_requirements_coverage()
+    _test_eval_ab_final_score_threshold()
 
     CON.rule("[bold magenta]UNIT TESTS — tmux[/]")
     _test_tmux_graceful_split_failure()
@@ -2021,6 +2192,7 @@ async def _run_tests() -> None:
     await _test_llm_long_input()
     await _test_llm_parallel()
     await _test_ralph_loop_aaaa_bounded()
+    await _test_ralph_loop_abab_bounded()
 
     wall = time.perf_counter() - t0
     CON.rule("[bold magenta]RESULTS[/]")
