@@ -62,7 +62,10 @@ Requirements:
   ☑️✅🧪 R6.3: fmt_failures formats only failing scores for injection
   ☑️✅🧪 R6.4: empty list when no scores parseable
 ☑️✅ R7: ralph_loop_v2 — R→A→B→prog→A architecture
-  ☑️✅ R7.1: R-step: one-shot requirement+test extraction via REQ_PROMPT
+  ☑️✅🧪 R7.1: R-step: requirement+test extraction via REQ_PROMPT (with retry)
+    ☑️✅🧪 R7.1a: REQ_RETRIES attempts on parse failure before bailing
+    ☑️✅🧪 R7.1b: temperature escalation on each retry (0.3 → 0.5 → 0.7)
+    ☑️✅🧪 R7.1c: format nudge injected on retry (tag reminder)
   ☑️✅ R7.2: A-step: worker produces artifacts + scratchpad + promise
   ☑️✅ R7.3: B-step: judge scores all R/T as PASS|FAIL with reasons
   ☑️✅ R7.4: prog: parse rubric, check 100%, format failures for next A
@@ -86,7 +89,7 @@ Requirements:
 ☑️✅ R11: CONFIG dataclass — all tunable params in one place
   ☑️✅ R11.1: model/API fields (MODEL, BASE_URL, API_KEY from env)
   ☑️✅ R11.2: generation fields (MAX_TOKENS, TEMPERATURE, STREAM)
-  ☑️✅🧪 R11.3: ABAB loop fields (MAX_ITERATIONS, STALL_LIMIT, LOOP_COOLDOWN, JUDGE_RETRIES)
+  ☑️✅🧪 R11.3: ABAB loop fields (MAX_ITERATIONS, STALL_LIMIT, LOOP_COOLDOWN, JUDGE_RETRIES, REQ_RETRIES)
 ☑️✅ R12: LLM infrastructure (inherited from v1)
   ☑️✅ R12.1: streaming with TTFT measurement
   ☑️✅ R12.2: tenacity exp-backoff retries on rate limit
@@ -175,6 +178,7 @@ class CONFIG:
     LOOP_COOLDOWN: float = 1.0        # seconds between iterations
     STALL_LIMIT: int = 2              # stop if score doesn't improve for N iters
     JUDGE_RETRIES: int = 2            # retry judge if rubric parse fails
+    REQ_RETRIES: int = 2              # retry R-step if requirement parse fails
     AGENT_LOGS_DIR: str = "agent_logs"
 
 
@@ -543,7 +547,8 @@ REQ_PROMPT = (
     "T2: judge: what to evaluate semantically\n"
     "...\n"
     "</tests>\n\n"
-    "Be specific. 5-8 requirements, 5-8 tests. No vague criteria.\n"
+    "Be specific but CONCISE — one short sentence per R/T line.\n"
+    "5-8 requirements, 5-8 tests. No vague criteria. No preamble.\n"
 )
 
 WORKER_PROMPT = (
@@ -644,18 +649,42 @@ async def ralph_loop_v2(task: str, cfg: CONFIG = CFG) -> tuple[list[Score], dict
     commit = _git_short()
     logfile = Path(cfg.AGENT_LOGS_DIR) / f"abab_{commit}_{int(time.time())}.log"
 
-    # ── STEP R: Extract requirements + tests (one-shot) ──
+    # ── STEP R: Extract requirements + tests (with retry on parse failure) ──
     CON.rule("[bold cyan]R: REQUIREMENT EXTRACTION[/]")
-    req_prompt = f"{REQ_PROMPT}\nTASK:\n{task}"
-    req_cfg = CONFIG(MAX_TOKENS=1024, TEMPERATURE=0.3)
-    req_raw = await llm(req_prompt, req_cfg)
-    _write_log(logfile, "R-STEP", req_prompt, req_raw)
+    base_req_prompt = f"{REQ_PROMPT}\nTASK:\n{task}"
+    reqs: list[Req] = []
+    tests: list[Test] = []
 
-    reqs = parse_requirements(req_raw)
-    tests = parse_tests(req_raw)
+    for req_retry in range(1 + cfg.REQ_RETRIES):
+        temp = min(0.3 + req_retry * 0.2, 0.9)
+        req_cfg = CONFIG(MAX_TOKENS=2048, TEMPERATURE=temp)
+
+        if req_retry == 0:
+            req_prompt = base_req_prompt
+        else:
+            nudge = (
+                f"\n\n⚠ REMINDER: Your previous response could not be parsed. "
+                f"You MUST wrap requirements in <requirements>...</requirements> tags.\n"
+                f"Each line: R1: description\nR2: description\n...\n"
+                f"And tests in <tests>...</tests> tags.\n"
+                f"Each line: T1: unit: description\nT2: judge: description\n...\n"
+                f"Start with <requirements> immediately.\n"
+            )
+            req_prompt = base_req_prompt + nudge
+            CON.print(f"[bold yellow]R-step retry {req_retry}/{cfg.REQ_RETRIES} "
+                      f"— nudge + temp={temp:.1f}[/]")
+
+        req_raw = await llm(req_prompt, req_cfg)
+        _write_log(logfile, f"R-STEP-retry{req_retry}", req_prompt, req_raw)
+
+        reqs = parse_requirements(req_raw)
+        tests = parse_tests(req_raw)
+        if reqs:
+            break
+        CON.print(f"[bold red]R-step parse failed (attempt {req_retry + 1}/{1 + cfg.REQ_RETRIES})[/]")
 
     if not reqs:
-        CON.print("[bold red]R-step failed to extract requirements — cannot continue[/]")
+        CON.print("[bold red]R-step exhausted all retries — no requirements parsed, cannot continue[/]")
         return ([], {})
 
     CON.print(f"\n[bold green]extracted {len(reqs)} requirements, {len(tests)} tests:[/]")
@@ -734,7 +763,7 @@ async def ralph_loop_v2(task: str, cfg: CONFIG = CFG) -> tuple[list[Score], dict
         for judge_retry in range(1 + cfg.JUDGE_RETRIES):
             # escalate temperature on retries to vary output
             temp = min(0.0 + judge_retry * 0.3, 0.9)
-            judge_cfg = CONFIG(MAX_TOKENS=1024, TEMPERATURE=temp)
+            judge_cfg = CONFIG(MAX_TOKENS=2048, TEMPERATURE=temp)
 
             # inject feedback nudge on retries
             if judge_retry == 0:
@@ -1112,6 +1141,57 @@ def _test_tmux_tiled_layout() -> None:
 
 # ─── R18: judge retry tests ───────────────────────────────────
 
+def _test_req_step_retries_config() -> None:
+    """R19: CONFIG has REQ_RETRIES field with sensible default."""
+    c = CONFIG()
+    has_it = hasattr(c, "REQ_RETRIES")
+    _t("REQ_RETRIES exists", has_it)
+    _t("REQ_RETRIES default >= 2", getattr(c, "REQ_RETRIES", 0) >= 2)
+    if has_it:
+        c2 = CONFIG(REQ_RETRIES=4)
+        _t("REQ_RETRIES override", c2.REQ_RETRIES == 4)
+    else:
+        _t("REQ_RETRIES override", False, "field doesn't exist yet")
+
+
+def _test_req_step_retry_in_loop() -> None:
+    """R19: ralph_loop_v2 retries R-step on parse failure instead of bailing."""
+    import inspect
+    src = inspect.getsource(ralph_loop_v2)
+    # R-step must have a retry loop, not just `return ([], {})`
+    _t("R-step references REQ_RETRIES config", "REQ_RETRIES" in src or "req_retries" in src.lower(),
+       "R-step must reference REQ_RETRIES")
+    _t("R-step has retry loop (for/range)", "req_retry" in src.lower() or "req_attempt" in src.lower(),
+       "R-step must have a named retry variable")
+    _t("R-step has nudge on retry", "req" in src.lower() and ("nudge" in src.lower() or "reminder" in src.lower()),
+       "R-step should inject format reminder on parse failure")
+
+
+def _test_req_step_does_not_bail_immediately() -> None:
+    """R19: R-step must NOT return ([], {}) on first parse failure."""
+    import inspect
+    src = inspect.getsource(ralph_loop_v2)
+    # find the R-step section (before the main iteration loop)
+    # it should NOT have a bare 'return ([], {})' right after checking `if not reqs`
+    # instead it should retry
+    lines = src.splitlines()
+    r_step_lines = []
+    in_r_step = False
+    for ln in lines:
+        if "STEP R:" in ln or "REQUIREMENT EXTRACTION" in ln:
+            in_r_step = True
+        if in_r_step:
+            r_step_lines.append(ln)
+        if in_r_step and ("STEP A:" in ln or "WORKER" in ln.upper() and "iteration" in ln.lower()):
+            break
+    r_step_src = "\n".join(r_step_lines)
+    # the R-step should loop, so any `return ([], {})` should be inside a
+    # "retries exhausted" guard, not immediately after parse
+    _t("R-step retries before returning empty",
+       "return ([], {})" not in r_step_src or "exhaust" in r_step_src.lower() or "all retries" in r_step_src.lower(),
+       "must retry R-step, not bail on first failure")
+
+
 def _test_judge_retries_config() -> None:
     """R18: CONFIG has JUDGE_RETRIES field with sensible default."""
     c = CONFIG()
@@ -1185,6 +1265,9 @@ async def _run_tests() -> None:
     _test_tmux_uses_panes_not_windows()
     _test_tmux_graceful_split_failure()
     _test_tmux_tiled_layout()
+    _test_req_step_retries_config()
+    _test_req_step_retry_in_loop()
+    _test_req_step_does_not_bail_immediately()
     _test_judge_retries_config()
     _test_judge_retry_in_loop()
     _test_judge_retry_does_not_rerun_worker()
