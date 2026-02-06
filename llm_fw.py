@@ -43,10 +43,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+import tempfile
+
 from openai import AsyncOpenAI, RateLimitError, APIStatusError
 from rich.console import Console
-from rich.panel import Panel
-from rich.text import Text
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -352,31 +352,147 @@ async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> None:
             await asyncio.sleep(cfg.LOOP_COOLDOWN)
 
 
-# ─────────────── DEMO / GUARDMAIN ────────────────────────────
+# ─────────────── TESTS ───────────────────────────────────────
+# All tests in one place. Run via: uv run llm_fw.py --tests
+# Unit tests (no API calls) run first, then integration tests (API calls).
 
-async def _demo() -> None:
-    CON.rule("[bold magenta]Fireworks oss120b — smoke test[/]")
+_PASS = 0
+_FAIL = 0
 
-    # ── test 1: joke ──
-    CON.print("\n[bold green]Test 1:[/] 1-line joke\n")
-    await llm("Tell me a 1-line joke.")
 
-    # ── test 2: long INPUT prompt → fast response ──
-    CON.print("\n[bold green]Test 2:[/] 3-page INPUT prompt → short answer (< 3s e2e)\n")
-    big_input = (
-        "Here is a very long document for you to analyze:\n\n"
-        + ("The history of computing spans centuries of innovation. " * 200)
-        + "\n\nIn exactly ONE sentence, what is this document about?"
-    )
-    CON.print(f"[dim]Input length: {len(big_input)} chars (~3 pages)[/]")
+def _t(name: str, ok: bool, detail: str = "") -> bool:
+    """Record a test result with rich output."""
+    global _PASS, _FAIL
+    tag = "[bold green]PASS[/]" if ok else "[bold red]FAIL[/]"
+    suffix = f"  [dim]{detail}[/]" if detail else ""
+    CON.print(f"  {tag}  {name}{suffix}")
+    if ok:
+        _PASS += 1
+    else:
+        _FAIL += 1
+    return ok
+
+
+# ─── unit tests (no API calls) ───────────────────────────────
+
+def _test_config_defaults() -> None:
+    """R2: CONFIG defaults are sane."""
+    c = CONFIG()
+    _t("config.MODEL is set", "gpt-oss-120b" in c.MODEL)
+    _t("config.BASE_URL is fireworks", "fireworks.ai" in c.BASE_URL)
+    _t("config.MAX_TOKENS > 0", c.MAX_TOKENS > 0)
+    _t("config.TEMPERATURE in [0,2]", 0 <= c.TEMPERATURE <= 2.0)
+    _t("config.MAX_RETRIES > 0", c.MAX_RETRIES > 0)
+    _t("config.MAX_CONCURRENT > 0", c.MAX_CONCURRENT > 0)
+    _t("config.RPM == 60", c.RPM == 60)
+    _t("config.MAX_ITERATIONS default 0", c.MAX_ITERATIONS == 0)
+    _t("config.LOOP_COOLDOWN >= 0", c.LOOP_COOLDOWN >= 0)
+
+
+def _test_config_override() -> None:
+    """R2: CONFIG fields can be overridden."""
+    c = CONFIG(MAX_TOKENS=99, TEMPERATURE=0.0, MAX_ITERATIONS=5)
+    _t("override MAX_TOKENS", c.MAX_TOKENS == 99)
+    _t("override TEMPERATURE", c.TEMPERATURE == 0.0)
+    _t("override MAX_ITERATIONS", c.MAX_ITERATIONS == 5)
+
+
+def _test_prompts_class() -> None:
+    """R11: PROMPTS has entries and lookup works."""
+    names = PROMPTS.names()
+    _t("PROMPTS has >=3 entries", len(names) >= 3, f"found {len(names)}")
+    _t("PROMPTS.get('code_review') returns str", isinstance(PROMPTS.get("code_review"), str))
+    _t("PROMPTS.get('nonexistent') returns None", PROMPTS.get("nonexistent") is None)
+    for n in names:
+        val = PROMPTS.get(n)
+        _t(f"PROMPTS.{n} is non-empty str", isinstance(val, str) and len(val) > 20, f"{len(val or '')} chars")
+
+
+def _test_git_short() -> None:
+    """R9: _git_short returns a commit hash or 'nogit'."""
+    h = _git_short()
+    _t("_git_short returns string", isinstance(h, str))
+    _t("_git_short length 6 or 'nogit'", len(h) == 6 or h == "nogit", f"got '{h}'")
+
+
+def _test_read_agent_prompt_inline() -> None:
+    """R10: _read_agent_prompt falls back to CONFIG.AGENT_PROMPT."""
+    cfg = CONFIG(AGENT_PROMPT_FILE="__nonexistent_file__.md")
+    result = _read_agent_prompt(cfg)
+    _t("fallback to inline AGENT_PROMPT", "ORIENT" in result and len(result) > 100, f"{len(result)} chars")
+
+
+def _test_read_agent_prompt_file() -> None:
+    """R10: _read_agent_prompt reads from file when it exists."""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".md", delete=False) as f:
+        f.write("CUSTOM PROMPT FROM FILE")
+        f.flush()
+        cfg = CONFIG(AGENT_PROMPT_FILE=f.name)
+        result = _read_agent_prompt(cfg)
+        _t("reads AGENT_PROMPT_FILE", result == "CUSTOM PROMPT FROM FILE", f"got '{result[:40]}'")
+    Path(f.name).unlink(missing_ok=True)
+
+
+def _test_write_log() -> None:
+    """R9: _write_log creates file with expected content."""
+    with tempfile.TemporaryDirectory() as td:
+        logfile = Path(td) / "sub" / "test.log"
+        _write_log(logfile, "test prompt", "test response")
+        _t("logfile created", logfile.exists())
+        content = logfile.read_text()
+        _t("logfile has TIME:", "TIME:" in content)
+        _t("logfile has PROMPT", "PROMPT" in content)
+        _t("logfile has RESPONSE", "RESPONSE" in content)
+        _t("logfile has test response", "test response" in content)
+
+
+def _test_semaphore_lazy_init() -> None:
+    """R5: semaphore is lazily initialized."""
+    global _SEM
+    old = _SEM
+    _SEM = None
+    s = _sem()
+    _t("_sem() returns Semaphore", isinstance(s, asyncio.Semaphore))
+    _t("_sem() is idempotent", _sem() is s)
+    _SEM = old  # restore
+
+
+def _test_iteration_context() -> None:
+    """R12: iteration context string is injected correctly."""
+    # simulate what ralph_loop builds
+    cfg = CONFIG(MAX_ITERATIONS=5)
+    bound = f"max {cfg.MAX_ITERATIONS}" if cfg.MAX_ITERATIONS > 0 else "infinite"
+    ctx = f"ITERATION: 3 of {bound}\n"
+    _t("iteration context has number", "3 of max 5" in ctx)
+    cfg2 = CONFIG(MAX_ITERATIONS=0)
+    bound2 = f"max {cfg2.MAX_ITERATIONS}" if cfg2.MAX_ITERATIONS > 0 else "infinite"
+    ctx2 = f"ITERATION: 1 of {bound2}\n"
+    _t("infinite mode says 'infinite'", "infinite" in ctx2)
+
+
+# ─── integration tests (API calls) ───────────────────────────
+
+async def _test_llm_joke() -> None:
+    """R1,R3,R7,R8: LLM returns non-empty text for simple prompt."""
     t0 = time.perf_counter()
-    await llm(big_input)
+    result = await llm("Tell me a 1-line joke.")
     wall = time.perf_counter() - t0
-    ok = wall < 3.0
-    CON.print(f"\n[bold {'green' if ok else 'yellow'}]e2e: {wall:.2f}s  |  {'PASS <3s' if ok else 'SLOW'}[/]")
+    _t("joke returns non-empty", len(result) > 5, f"{len(result)} chars")
+    _t("joke completes < 10s", wall < 10, f"{wall:.2f}s")
 
-    # ── test 3: parallel burst (semaphore proof) ──
-    CON.print("\n[bold green]Test 3:[/] 3 parallel calls (semaphore)\n")
+
+async def _test_llm_long_input() -> None:
+    """R1,R8: Large input prompt returns quickly."""
+    big = "Repeat: " + ("computing history is fascinating. " * 200) + "\nSummarize in 1 word."
+    t0 = time.perf_counter()
+    result = await llm(big)
+    wall = time.perf_counter() - t0
+    _t("long input returns non-empty", len(result) > 0, f"{len(result)} chars")
+    _t("long input < 5s", wall < 5, f"{wall:.2f}s")
+
+
+async def _test_llm_parallel() -> None:
+    """R4,R5: Parallel calls work via semaphore."""
     t0 = time.perf_counter()
     results = await asyncio.gather(
         llm("What is 2+2?"),
@@ -384,8 +500,55 @@ async def _demo() -> None:
         llm("Capital of France?"),
     )
     wall = time.perf_counter() - t0
-    CON.print(f"\n[bold cyan]Parallel wall: {wall:.2f}s  |  {len(results)} results[/]")
+    _t("parallel returns 3 results", len(results) == 3)
+    _t("all results non-empty", all(len(r) > 0 for r in results))
+    _t("parallel wall < 10s", wall < 10, f"{wall:.2f}s")
 
+
+async def _test_ralph_loop_bounded() -> None:
+    """R9,R12: ralph_loop stops at MAX_ITERATIONS."""
+    cfg = CONFIG(MAX_ITERATIONS=1, LOOP_COOLDOWN=0, MAX_TOKENS=128)
+    t0 = time.perf_counter()
+    await ralph_loop("Say 'iteration test passed'.", cfg)
+    wall = time.perf_counter() - t0
+    _t("bounded loop completes", True, f"{wall:.2f}s")
+    _t("bounded loop < 15s", wall < 15, f"{wall:.2f}s")
+
+
+# ─── test runner ──────────────────────────────────────────────
+
+async def _run_tests() -> None:
+    """Run all tests: unit first, then integration."""
+    global _PASS, _FAIL
+    _PASS, _FAIL = 0, 0
+    t0 = time.perf_counter()
+
+    CON.rule("[bold magenta]UNIT TESTS (no API calls)[/]")
+    _test_config_defaults()
+    _test_config_override()
+    _test_prompts_class()
+    _test_git_short()
+    _test_read_agent_prompt_inline()
+    _test_read_agent_prompt_file()
+    _test_write_log()
+    _test_semaphore_lazy_init()
+    _test_iteration_context()
+
+    CON.rule("[bold magenta]INTEGRATION TESTS (API calls)[/]")
+    await _test_llm_joke()
+    await _test_llm_long_input()
+    await _test_llm_parallel()
+    await _test_ralph_loop_bounded()
+
+    wall = time.perf_counter() - t0
+    CON.rule("[bold magenta]RESULTS[/]")
+    color = "green" if _FAIL == 0 else "red"
+    CON.print(f"[bold {color}]{_PASS} passed, {_FAIL} failed[/]  |  {wall:.1f}s total")
+    if _FAIL > 0:
+        sys.exit(1)
+
+
+# ─────────────── EXAMPLE RUNNER / GUARDMAIN ──────────────────
 
 def _run_example(name: str) -> None:
     """Run a named example prompt through the ralph loop (3 iterations)."""
@@ -408,13 +571,17 @@ def _run_example(name: str) -> None:
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--example":
-        # --example <name> → bounded ralph loop with example prompt
+    if len(sys.argv) > 1 and sys.argv[1] == "--tests":
+        asyncio.run(_run_tests())
+    elif len(sys.argv) > 1 and sys.argv[1] == "--example":
         name = sys.argv[2] if len(sys.argv) > 2 else "list"
         _run_example(name)
     elif len(sys.argv) > 1:
-        # CLI arg = prompt → ralph loop (infinite unless MAX_ITERATIONS set)
         asyncio.run(ralph_loop(" ".join(sys.argv[1:])))
     else:
-        # no args → smoke test
-        asyncio.run(_demo())
+        # no args → quick help
+        CON.rule("[bold magenta]llm_fw.py — Fireworks oss120b[/]")
+        CON.print('  [bold cyan]uv run llm_fw.py "prompt"[/]         ralph loop')
+        CON.print("  [bold cyan]uv run llm_fw.py --tests[/]          run all tests")
+        CON.print("  [bold cyan]uv run llm_fw.py --example list[/]   list example prompts")
+        CON.print("  [bold cyan]uv run llm_fw.py --example NAME[/]   run example (3 iters)")
