@@ -9,6 +9,7 @@
                             CONFIG per-step bug fixed (replace() instead of fresh CONFIG()).
                             _ARTIFACT_RE handles unquoted name=foo attrs.
                             ABAB judge retries on unparseable output (PROGRESS_RETRIES).
+                            ABAB R-step retries on parse failure (nudge + temp escalation).
                             ABAB evals: 4 programmatic + 3 LLM-judge + 1 thread = 8 (matches AAAA).
 
 Usage:
@@ -52,7 +53,7 @@ Requirements:
 ☑️✅🧪 R9: parse_artifacts, parse_scratchpad, parse_promise
   ☑️✅🧪 R9.1: _ARTIFACT_RE handles unquoted name=foo (LLMs sometimes omit quotes)
 ☑️✅🧪 R10: parse_requirements, parse_tests, parse_rubric (Req/Test/Score)
-☑️✅🧪 R11: R→A→B→prog architecture with stall detection + judge retry
+☑️✅🧪 R11: R→A→B→prog architecture with stall detection + judge retry + R-step retry
 ☑️✅🧪 R12: ABLoopResult + thread + Rich summary (NEW in v3)
 ☑️✅🧪 R13: AB_TENETS (5 criteria) + _build_ab_analysis_prompt (NEW in v3)
 
@@ -924,18 +925,42 @@ async def ralph_loop_abab(task: str, cfg: CONFIG = CFG) -> ABLoopResult:
     commit = _git_short()
     logfile = Path(cfg.AGENT_LOGS_DIR) / f"abab_{commit}_{int(time.time())}.log"
 
-    # ── STEP R: Extract requirements + tests (one-shot) ──
+    # ── STEP R: Extract requirements + tests (with retry on parse failure) ──
     CON.rule("[bold cyan]R: REQUIREMENT EXTRACTION[/]")
-    req_prompt = f"{REQ_PROMPT}\nTASK:\n{task}"
-    req_cfg = replace(cfg, MAX_TOKENS=1024, TEMPERATURE=0.3)  # FIX: inherits API_KEY
-    req_raw = await llm(req_prompt, req_cfg)
-    _write_log(logfile, "R-STEP", req_prompt, req_raw)
+    base_req_prompt = f"{REQ_PROMPT}\nTASK:\n{task}"
+    reqs: list[Req] = []
+    tests: list[Test] = []
 
-    reqs = parse_requirements(req_raw)
-    tests = parse_tests(req_raw)
+    for r_attempt in range(1 + cfg.PROGRESS_RETRIES):
+        temp = min(0.3 + r_attempt * 0.2, 0.9)
+        req_cfg = replace(cfg, MAX_TOKENS=2048, TEMPERATURE=temp)
+
+        if r_attempt == 0:
+            req_prompt = base_req_prompt
+        else:
+            nudge = (
+                "\n\n⚠ REMINDER: Your previous response could not be parsed. "
+                "You MUST wrap requirements in <requirements>...</requirements> tags.\n"
+                "Each line: R1: description\nR2: description\n...\n"
+                "And tests in <tests>...</tests> tags.\n"
+                "Each line: T1: unit: description\nT2: judge: description\n...\n"
+                "Start with <requirements> immediately.\n"
+            )
+            req_prompt = base_req_prompt + nudge
+            CON.print(f"[bold yellow]R-step retry {r_attempt}/{cfg.PROGRESS_RETRIES} "
+                      f"— nudge + temp={temp:.1f}[/]")
+
+        req_raw = await llm(req_prompt, req_cfg)
+        _write_log(logfile, f"R-STEP-{r_attempt}", req_prompt, req_raw)
+
+        reqs = parse_requirements(req_raw)
+        tests = parse_tests(req_raw)
+        if reqs:
+            break
+        CON.print(f"[bold yellow]⚠ R-step parse failed (attempt {r_attempt + 1}/{1 + cfg.PROGRESS_RETRIES})[/]")
 
     if not reqs:
-        CON.print("[bold red]R-step failed to extract requirements — cannot continue[/]")
+        CON.print("[bold red]R-step exhausted all retries — no requirements parsed, cannot continue[/]")
         return ABLoopResult(
             iterations=0, total_time=0, final_scores=[], artifacts={},
             requirements=[], tests=[], thread=[], score_history=[],
