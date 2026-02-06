@@ -9,9 +9,23 @@
 
 Usage:
     uv run llm_fw_v2_ABAB.py "your task here"    # run ABAB loop
+    uv run llm_fw_v2_ABAB.py --example algorithm # run one example
+    uv run llm_fw_v2_ABAB.py --example all       # tmux grid: all 8 in parallel
+    uv run llm_fw_v2_ABAB.py --example list      # list available examples
     uv run llm_fw_v2_ABAB.py --tests             # unit + integration tests
     uv run llm_fw_v2_ABAB.py --eval              # full eval run
+    uv run llm_fw_v2_ABAB.py --kill              # kill tmux session
     uv run llm_fw_v2_ABAB.py                     # help
+
+Examples (progressive difficulty):
+    1. fizzbuzz       — trivial one-shot (~1 iter)
+    2. algorithm      — binary heap priority queue (~1-2 iters)
+    3. bug_hunt       — trace empty-response bug (~2 iters)
+    4. feature_design — circuit breaker design (~2-3 iters)
+    5. refactor       — CONFIG dataclass redesign (~3 iters)
+    6. architecture   — parallel agent system (~4-5 iters)
+    7. interpreter    — calculator language w/ lexer/parser/eval (~5-7 iters)
+    8. full_system    — distributed task queue system (MANY iters)
 
 Requirements:
 
@@ -87,6 +101,18 @@ Requirements:
   ☑️✅🧪 R15.1: Req(id, desc) for requirements
   ☑️✅🧪 R15.2: Test(id, kind, desc) for acceptance tests
   ☑️✅🧪 R15.3: Score(id, passed, reason) for rubric results
+☑️✅ R16: PROMPTS class — 8 progressive examples (tuple format)
+  ☑️✅ R16.1: fizzbuzz (trivial), algorithm (easy), bug_hunt (easy-med)
+  ☑️✅ R16.2: feature_design (medium), refactor (medium)
+  ☑️✅ R16.3: architecture (hard), interpreter (hard)
+  ☑️✅ R16.4: full_system (very hard — MANY iters)
+  ☑️✅ R16.5: .get(name), .names() classmethods
+☑️✅ R17: Example runner + tmux grid
+  ☑️✅ R17.1: --example NAME runs single example via ABAB loop
+  ☑️✅ R17.2: --example list shows all examples with previews
+  ☑️✅ R17.3: --example all launches tmux grid (all 8 in parallel)
+  ☑️✅ R17.4: --kill terminates tmux session
+  ☑️✅ R17.5: tmux optimized — single layout pass, staggered starts, remain-on-exit
 ⛔ Tool-use / function-calling
 """
 # /// script
@@ -150,6 +176,142 @@ class CONFIG:
 
 CFG = CONFIG()
 CON = Console()
+
+# ─────────────── EXAMPLE PROMPTS ─────────────────────────────
+# Tuple format, progressively harder. Usage: --example <name>
+
+class PROMPTS:
+    """Example prompts — progressively harder. 1=easy (~1 iter), 8=hard (many)."""
+
+    # ── All prompts are SELF-CONTAINED: no file access, no tool-use. ──
+
+    # ── 1. trivial: one-shot answer (~1 iter) ──
+    fizzbuzz = (
+        "Write FizzBuzz in Python for 1 to 100.\n"
+        "1. Print 'Fizz' for multiples of 3, 'Buzz' for 5, 'FizzBuzz' for both.\n"
+        "2. Write 3 pytest tests covering the key cases.\n"
+        "3. STATUS: done or not."
+    )
+
+    # ── 2. easy: small algorithm (~1-2 iters) ──
+    algorithm = (
+        "Implement a priority queue backed by a binary heap in Python.\n"
+        "1. Write the class with push, pop, peek, and __len__.\n"
+        "2. Use a list as the backing store, no heapq import.\n"
+        "3. Support (priority, item) tuples, lower priority = higher urgency.\n"
+        "4. Write 5 pytest tests covering: empty pop, ordering, duplicates, peek, len.\n"
+        "5. Analyze time complexity for each operation.\n"
+        "6. STATUS: implementation complete? tests pass? edge cases covered?"
+    )
+
+    # ── 3. easy-medium: trace a bug (~2 iters) ──
+    bug_hunt = (
+        "A streaming LLM API sometimes returns empty text. The code does:\n"
+        "  chunks = []\n"
+        "  async for chunk in stream:\n"
+        "    delta = chunk.choices[0].delta.content\n"
+        "    if delta: chunks.append(delta)\n"
+        "  return ''.join(chunks)\n\n"
+        "1. Trace the data flow and list every place empty/None could leak.\n"
+        "2. For each, propose a defensive check with exact code.\n"
+        "3. Write a pytest that reproduces the empty-response edge case.\n"
+        "4. STATUS: root causes found, fixes proposed, confidence level."
+    )
+
+    # ── 4. medium: design a component (~2-3 iters) ──
+    feature_design = (
+        "Design a retry-with-circuit-breaker for an async Python LLM caller.\n"
+        "1. Define the state machine: CLOSED → OPEN → HALF-OPEN.\n"
+        "2. Specify thresholds: failure count, timeout, half-open probe.\n"
+        "3. Write the Python dataclass for CircuitBreaker state.\n"
+        "4. Write the async wrapper function with full type hints.\n"
+        "5. Write 3 unit tests (pytest style) covering each transition.\n"
+        "6. STATUS: what's designed, what needs refinement, what's next."
+    )
+
+    # ── 5. medium: refactor existing code (~3 iters) ──
+    refactor = (
+        "Refactor this CONFIG dataclass:\n\n"
+        "  @dataclass\n"
+        "  class CONFIG:\n"
+        "    MODEL: str = 'gpt-oss-120b'\n"
+        "    BASE_URL: str = 'https://api.fireworks.ai/inference/v1'\n"
+        "    API_KEY: str = ''  # from env\n"
+        "    MAX_TOKENS: int = 4096\n"
+        "    TEMPERATURE: float = 0.7\n"
+        "    MAX_CONCURRENT: int = 10\n"
+        "    MAX_RETRIES: int = 3\n"
+        "    BACKOFF_MIN: float = 1.0\n"
+        "    BACKOFF_MAX: float = 8.0\n"
+        "    LOOP_COOLDOWN: float = 1.0\n"
+        "    MAX_ITERATIONS: int = 0\n\n"
+        "1. Group related fields into nested dataclasses (ModelCfg, RetryCfg, etc).\n"
+        "2. Add validation in __post_init__ (e.g. MAX_TOKENS > 0).\n"
+        "3. Add a .from_env() classmethod that loads from env vars.\n"
+        "4. Show the complete refactored code.\n"
+        "5. STATUS: what changed, what's cleaner, backwards-compat notes."
+    )
+
+    # ── 6. hard: system architecture (~4-5 iters) ──
+    architecture = (
+        "Design a parallel agent system for autonomous coding (no tool-use required).\n"
+        "1. Define the coordination protocol: task locks, git sync, conflict resolution.\n"
+        "2. Sketch the Docker container setup for N parallel agents.\n"
+        "3. Write the AGENT_PROMPT.md content that each agent reads.\n"
+        "4. Write the bash harness (while-true loop + git push/pull).\n"
+        "5. Design the failure recovery: agent crash, merge conflict, deadlock.\n"
+        "6. Write a monitoring dashboard design (what metrics, how displayed).\n"
+        "7. STATUS: architecture complete? gaps? next steps?"
+    )
+
+    # ── 7. hard: build an interpreter (~5-7 iters) ──
+    interpreter = (
+        "Build a calculator language interpreter in Python.\n"
+        "The language supports: integers, floats, +, -, *, /, parentheses,\n"
+        "variable assignment (let x = 5), and if/else expressions.\n\n"
+        "1. Write a Lexer class that tokenizes input strings.\n"
+        "2. Write a Parser class that builds an AST from tokens.\n"
+        "3. Write an Evaluator class that walks the AST and computes results.\n"
+        "4. Support these expressions:\n"
+        "   - '2 + 3 * 4' → 14\n"
+        "   - 'let x = 10; x * 2' → 20\n"
+        "   - 'if 1 > 0 then 42 else 0' → 42\n"
+        "5. Write 8 pytest tests covering: arithmetic, precedence, variables,\n"
+        "   if/else, nested parens, division by zero, syntax errors.\n"
+        "6. Add error messages with line/column info.\n"
+        "7. STATUS: what works, what's missing, what edge cases remain."
+    )
+
+    # ── 8. very hard: full system design (MANY iters) ──
+    full_system = (
+        "Design and implement a complete distributed task queue system in Python.\n\n"
+        "COMPONENTS (all must be fully coded, not just sketched):\n"
+        "1. TaskQueue class: submit(task), get_next(), complete(task_id), fail(task_id, reason).\n"
+        "2. Worker class: polls queue, executes tasks, reports results.\n"
+        "3. Scheduler: priority-based, with retry logic (3 attempts, exp backoff).\n"
+        "4. Dead-letter queue: tasks that fail 3x are moved here.\n"
+        "5. Concurrency: support N workers processing in parallel (asyncio).\n"
+        "6. Persistence: tasks survive restart (use sqlite3, no external deps).\n"
+        "7. Monitoring: track task counts by state (pending/running/done/failed/dead).\n"
+        "8. CLI: submit, status, drain, purge-dead commands.\n\n"
+        "ACCEPTANCE CRITERIA:\n"
+        "- All classes fully implemented with type hints and docstrings.\n"
+        "- 10+ pytest tests covering: submit/get, priority ordering, retry logic,\n"
+        "  dead-letter, concurrent workers, persistence across restart, monitoring.\n"
+        "- Error handling: worker crash, db corruption, duplicate task IDs.\n"
+        "- The design must be explained: why each decision, tradeoffs considered.\n\n"
+        "STATUS: what's built, what's tested, what needs work."
+    )
+
+    @classmethod
+    def get(cls, name: str) -> str | None:
+        val = getattr(cls, name, None)
+        return val if isinstance(val, str) else None
+
+    @classmethod
+    def names(cls) -> list[str]:
+        return [k for k in vars(cls) if not k.startswith("_") and isinstance(getattr(cls, k), str)]
+
 
 # ─────────────── GLOBAL SEMAPHORE ─────────────────────────────
 
@@ -871,6 +1033,18 @@ def _test_config_v2() -> None:
     _t("MAX_ITERATIONS override", c2.MAX_ITERATIONS == 10)
 
 
+def _test_prompts_v2() -> None:
+    """R16: PROMPTS class has 8 entries and lookup works."""
+    names = PROMPTS.names()
+    _t("PROMPTS has 8 entries", len(names) == 8, f"found {len(names)}")
+    _t("PROMPTS.get('fizzbuzz') returns str", isinstance(PROMPTS.get("fizzbuzz"), str))
+    _t("PROMPTS.get('full_system') returns str", isinstance(PROMPTS.get("full_system"), str))
+    _t("PROMPTS.get('nonexistent') returns None", PROMPTS.get("nonexistent") is None)
+    for n in names:
+        val = PROMPTS.get(n)
+        _t(f"PROMPTS.{n} is non-empty str", isinstance(val, str) and len(val) > 20, f"{len(val or '')} chars")
+
+
 # ─── test runner ──────────────────────────────────────────────
 
 async def _run_tests() -> None:
@@ -887,6 +1061,7 @@ async def _run_tests() -> None:
     _test_parse_rubric()
     _test_parse_full_worker_output()
     _test_config_v2()
+    _test_prompts_v2()
 
     CON.rule("[bold magenta]INTEGRATION TESTS — LLM calls[/]")
     # quick smoke test: LLM responds
@@ -901,6 +1076,75 @@ async def _run_tests() -> None:
     CON.print(f"[bold {color}]{_PASS} passed, {_FAIL} failed[/]  |  {wall:.1f}s total")
     if _FAIL > 0:
         sys.exit(1)
+
+
+# ─────────────── EXAMPLE RUNNER / TMUX ────────────────────────
+
+def _run_all_tmux() -> None:
+    """Launch all examples in a tmux pane grid, one per pane, in parallel.
+
+    Optimizations: create all panes FIRST, layout ONCE, stagger starts,
+    remain-on-exit, minimal status bar.
+    """
+    names = PROMPTS.names()
+    session = "ralph-v2-all"
+    script = os.path.abspath(__file__)
+
+    subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
+    subprocess.run([
+        "tmux", "new-session", "-d", "-s", session, "-x", "220", "-y", "60",
+    ], check=True)
+    for opt in [
+        ["set-option", "-t", session, "remain-on-exit", "on"],
+        ["set-option", "-t", session, "status", "off"],
+    ]:
+        subprocess.run(["tmux"] + opt, capture_output=True)
+
+    # create all panes first (one already exists)
+    for _ in names[1:]:
+        subprocess.run(["tmux", "split-window", "-t", session], check=True)
+
+    # single layout pass
+    subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], check=True)
+
+    # send staggered commands to each pane
+    for i, n in enumerate(names):
+        delay = f"sleep {i * 0.3:.1f} && " if i > 0 else ""
+        subprocess.run([
+            "tmux", "send-keys", "-t", f"{session}:{0}.{i}",
+            f"{delay}uv run {script} --example {n}", "Enter",
+        ], check=True)
+
+    CON.print(f"[bold green]launched {len(names)} examples in tmux session '{session}'[/]")
+    CON.print(f"[dim]attach: tmux attach -t {session}  |  kill: tmux kill-session -t {session}[/]")
+    if sys.stdout.isatty():
+        os.execvp("tmux", ["tmux", "attach", "-t", session])
+    else:
+        CON.print(f"[dim]not a TTY — run 'tmux attach -t {session}' manually[/]")
+
+
+def _run_example(name: str) -> None:
+    """Run a named example through the ABAB loop."""
+    if name == "list":
+        CON.rule("[bold magenta]available example prompts (v2 ABAB)[/]")
+        for n in PROMPTS.names():
+            preview = (getattr(PROMPTS, n) or "")[:80].replace("\n", " ")
+            CON.print(f"  [bold cyan]{n:<20}[/] {preview}…")
+        return
+
+    if name == "all":
+        _run_all_tmux()
+        return
+
+    prompt = PROMPTS.get(name)
+    if not prompt:
+        CON.print(f"[bold red]unknown example:[/] {name}")
+        CON.print(f"[dim]available: {', '.join(PROMPTS.names())}  |  all[/]")
+        sys.exit(1)
+
+    CON.print(f"[bold green]running example (v2 ABAB):[/] {name}\n")
+    cfg = CONFIG(MAX_ITERATIONS=10, LOOP_COOLDOWN=0.5, MAX_TOKENS=4096)
+    asyncio.run(ralph_loop_v2(prompt, cfg))
 
 
 # ─────────────── GUARDMAIN ───────────────────────────────────
@@ -923,10 +1167,21 @@ if __name__ == "__main__":
                 p, t, pct = fmt_score(scores)
                 CON.print(f"\n[bold]EVAL RESULT: {p}/{t} ({pct:.0f}%)[/]")
         asyncio.run(_eval())
+    elif len(sys.argv) > 1 and sys.argv[1] == "--kill":
+        r = subprocess.run(["tmux", "kill-session", "-t", "ralph-v2-all"], capture_output=True)
+        CON.print("[bold green]killed tmux session 'ralph-v2-all'[/]" if r.returncode == 0
+                  else "[dim]no 'ralph-v2-all' session running[/]")
+    elif len(sys.argv) > 1 and sys.argv[1] == "--example":
+        name = sys.argv[2] if len(sys.argv) > 2 else "list"
+        _run_example(name)
     elif len(sys.argv) > 1:
         asyncio.run(ralph_loop_v2(" ".join(sys.argv[1:])))
     else:
-        CON.rule("[bold magenta]llm_fw_v2_ABAB.py — Fireworks oss120b[/]")
-        CON.print('  [bold cyan]uv run llm_fw_v2_ABAB.py "task"[/]       ABAB loop')
-        CON.print("  [bold cyan]uv run llm_fw_v2_ABAB.py --tests[/]      run all tests")
-        CON.print("  [bold cyan]uv run llm_fw_v2_ABAB.py --eval[/]       eval run (kv-store task)")
+        CON.rule("[bold magenta]llm_fw_v2_ABAB.py — Fireworks oss120b (ABAB loop)[/]")
+        CON.print('  [bold cyan]uv run llm_fw_v2_ABAB.py "task"[/]          ABAB loop')
+        CON.print("  [bold cyan]uv run llm_fw_v2_ABAB.py --example NAME[/]  run example")
+        CON.print("  [bold cyan]uv run llm_fw_v2_ABAB.py --example all[/]   tmux grid: all 8 in parallel")
+        CON.print("  [bold cyan]uv run llm_fw_v2_ABAB.py --example list[/]  list examples")
+        CON.print("  [bold cyan]uv run llm_fw_v2_ABAB.py --tests[/]         run all tests")
+        CON.print("  [bold cyan]uv run llm_fw_v2_ABAB.py --eval[/]          eval run (kv-store task)")
+        CON.print("  [bold cyan]uv run llm_fw_v2_ABAB.py --kill[/]          kill tmux session")
