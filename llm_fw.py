@@ -1,9 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
 """Fireworks oss120b LLM caller + ralph loop — no tool-use.
 
 Usage:
-    uv run llm_fw.py "your prompt here"   # ralph loop (while-true)
-    uv run llm_fw.py                      # smoke-test demo
+    uv run llm_fw.py "your prompt here"       # ralph loop
+    uv run llm_fw.py --example code_review    # run example prompt (3 iters)
+    uv run llm_fw.py --example list           # list available examples
+    uv run llm_fw.py                          # smoke-test demo
 
 Requirements:
 ☑️ R1: Call gpt-oss-120b on Fireworks via OpenAI-compatible API
@@ -16,11 +18,13 @@ Requirements:
 ☑️ R8: Streaming for fast TTFT
 ☑️ R9: ralph_loop(prompt) — while-true loop, logs per-commit
 ☑️ R10: AGENT_PROMPT in CONFIG, read fresh each iteration
+☑️ R11: PROMPTS class w/ example prompts (tuple format)
+☑️ R12: MAX_ITERATIONS for bounded loop runs (0 = infinite)
 ⛔ Tool-use / function-calling
 ⛔ Multi-turn memory (stateless per call)
 """
 # /// script
-# requires-python = ">=3.11"
+# requires-python = ">=3.12"
 # dependencies = [
 #   "openai>=2.10.0",
 #   "tenacity>=9.0.0",
@@ -75,11 +79,32 @@ class CONFIG:
     BACKOFF_MAX: float = 8.0          # seconds
 
     # ── ralph loop ──
+    # Full agent prompt — pattern from anthropic.com/engineering/building-c-compiler
+    # The AGENT_PROMPT_FILE overrides this if it exists on disk.
     AGENT_PROMPT: str = (
-        "You are a senior software engineer working autonomously.\n"
-        "Review the current state of the codebase, decide what to work on next,\n"
-        "and provide your analysis, plan, and any code changes.\n"
-        "Be specific and actionable."
+        # ── role & mindset ──
+        "You are a senior software engineer working autonomously in a loop.\n"
+        "Each iteration you start fresh — no memory of previous runs.\n"
+        "Your only context is this prompt, the codebase, and any files you read.\n\n"
+        # ── approach: decompose → track → self-direct → persist ──
+        "APPROACH:\n"
+        "1. ORIENT — Read progress files, READMEs, and recent git log to understand current state.\n"
+        "2. DECOMPOSE — Break the task into small, independently-completable pieces.\n"
+        "3. PICK ONE — Choose the highest-value next piece. Don't redo finished work.\n"
+        "4. EXECUTE — Implement it. Write code, tests, or analysis as needed.\n"
+        "5. RECORD — Update progress files so the NEXT iteration knows what you did.\n"
+        "6. NEVER STOP EARLY — Keep going until the piece is complete and verified.\n\n"
+        # ── state management (you start fresh each loop) ──
+        "STATE MANAGEMENT:\n"
+        "- Maintain a PROGRESS.md with: what's done, what's in-progress, what's next.\n"
+        "- Log errors with 'ERROR:' prefix on the same line (grep-friendly).\n"
+        "- Pre-compute summary stats instead of dumping raw output.\n"
+        "- Keep context concise — don't emit thousands of lines of noise.\n\n"
+        # ── quality ──
+        "QUALITY:\n"
+        "- Each change should be small, correct, and tested before moving on.\n"
+        "- Don't break existing functionality — verify before and after.\n"
+        "- If stuck, document what you tried and why it failed, then move on.\n"
     )
     AGENT_PROMPT_FILE: str = "AGENT_PROMPT.md"  # overrides AGENT_PROMPT if exists
     AGENT_LOGS_DIR: str = "agent_logs"
