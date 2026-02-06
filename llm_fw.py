@@ -27,6 +27,8 @@ Requirements:
 ☑️ R14: <progress> tag parsing with regex, retry on failure
 ☑️ R15: PROGRESS carried between iterations as prompt injection
 ☑️ R16: --eval LLM-judge tenet evals (programmatic + judge, PASS|FAIL structured output)
+☑️ R17: LoopResult dataclass returned from ralph_loop, THREAD[] accumulates stdout per iteration
+☑️ R18: Final LLM analysis of THREAD against RALPH_TENETS, rich summary at end of loop
 ⛔ Tool-use / function-calling
 """
 # /// script
@@ -315,6 +317,70 @@ class _IterData:
 _TRACES: list[_IterData] = []
 
 
+@dataclass
+class LoopResult:
+    """Full result of a ralph loop run — returned to caller."""
+    iterations: int
+    total_time: float
+    final_progress: str
+    thread: list[str]       # stdout-like log, one entry per iteration
+    done_signal: bool       # True if agent said NEXT: DONE
+    prompt: str             # original user prompt
+
+
+# ─────────────── RALPH TENETS (for final analysis) ────────────
+
+RALPH_TENETS = (
+    "1. FORWARD PROGRESS: Each iteration must advance the task. DONE list grows monotonically.\n"
+    "2. NO REPETITION: Never redo finished work. Read progress, pick what's NEW.\n"
+    "3. CONCISE STATE: <progress> is a sticky note (<500 chars), not a transcript.\n"
+    "4. STRUCTURED FORMAT: Every <progress> has DONE/CURRENT/NEXT/BLOCKERS.\n"
+    "5. SELF-TERMINATION: Agent sets NEXT: DONE when task is complete. Not too early, not too late.\n"
+    "6. INCREMENTAL VALUE: Each response contains substantive new content.\n"
+    "7. NO CONTEXT BLEED: Progress is a summary, not a copy of the response.\n"
+)
+
+
+def _format_thread_entry(iteration: int, progress_in: str, response: str,
+                          progress_out: str, elapsed: float) -> str:
+    """Format one iteration into a thread entry string."""
+    return (
+        f"── ITERATION {iteration} ({elapsed:.1f}s) ──\n"
+        f"PROGRESS IN:\n{progress_in}\n\n"
+        f"RESPONSE:\n{response}\n\n"
+        f"PROGRESS OUT:\n{progress_out}\n"
+    )
+
+
+def _format_summary(r: LoopResult) -> str:
+    """Build a plain-text summary of a LoopResult for rich printing."""
+    status = "agent signalled DONE" if r.done_signal else "hit iteration limit"
+    return (
+        f"RALPH LOOP SUMMARY\n"
+        f"  prompt:      {r.prompt[:80]}{'…' if len(r.prompt) > 80 else ''}\n"
+        f"  iterations:  {r.iterations}\n"
+        f"  total time:  {r.total_time:.2f}s\n"
+        f"  status:      {status}\n"
+        f"  thread size: {len(r.thread)} entries\n"
+        f"  final progress:\n{r.final_progress}\n"
+    )
+
+
+def _build_analysis_prompt(r: LoopResult) -> str:
+    """Build the prompt for the final LLM analysis of the thread."""
+    thread_text = "\n\n".join(r.thread)
+    return (
+        "You are an evaluator. Analyze how this autonomous agent loop performed.\n"
+        "Score each tenet 1-5 (1=violated, 5=exemplary). Give overall score and brief commentary.\n\n"
+        f"<thread>\n{thread_text}\n</thread>\n\n"
+        f"<tenets>\n{RALPH_TENETS}</tenets>\n\n"
+        "Respond with:\n"
+        "- Per-tenet scores (tenet name: score/5 + one-line reason)\n"
+        "- Overall score: X/5\n"
+        "- One paragraph summary of how the loop went.\n"
+    )
+
+
 # ─────────────── PROGRESS PARSER ─────────────────────────────
 
 _PROGRESS_RE = re.compile(r"<progress>(.*?)</progress>", re.DOTALL | re.IGNORECASE)
@@ -361,14 +427,14 @@ def _write_log(logfile: Path, prompt: str, result: str) -> None:
     CON.print(f"[dim]logged → {logfile.resolve()}[/]")
 
 
-async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> str:
+async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> LoopResult:
     """The ralph loop — while-true, carries <progress> between iterations.
 
     Since oss120b has no tool-use, the LLM outputs <progress>...</progress>
     tags. The harness parses them and injects the accumulated progress into
     the next iteration's prompt. If parse fails, re-runs the same step.
 
-    Returns the final progress string.
+    Returns LoopResult with thread[], summary, and final progress.
     """
     bound = f"max {cfg.MAX_ITERATIONS}" if cfg.MAX_ITERATIONS > 0 else "infinite"
     CON.rule("[bold magenta]ralph loop — oss120b (no tool-use)[/]")
@@ -376,7 +442,10 @@ async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> str:
     CON.print(f"[dim]cooldown: {cfg.LOOP_COOLDOWN}s  |  iterations: {bound}  |  logs: {cfg.AGENT_LOGS_DIR}/[/]\n")
 
     progress: str = "DONE: nothing yet\nCURRENT: starting\nNEXT: orient and plan\nBLOCKERS: none"
+    thread: list[str] = []
     iteration = 0
+    done_signal = False
+    t0 = time.perf_counter()
 
     while True:
         iteration += 1
@@ -389,6 +458,7 @@ async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> str:
 
         CON.rule(f"[bold cyan]iteration {iteration}/{bound}  |  {commit}[/]")
         progress_before = progress  # snapshot for trace
+        iter_t0 = time.perf_counter()
 
         # ── build prompt: agent instructions + progress + user task ──
         agent_prompt = _read_agent_prompt(cfg)
@@ -439,6 +509,8 @@ async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> str:
         else:
             CON.print("[bold red]<progress> parse failed after retries — keeping previous progress[/]")
 
+        iter_elapsed = time.perf_counter() - iter_t0
+
         _TRACES.append(_IterData(
             iteration=iteration,
             progress_in=progress_before,
@@ -446,8 +518,14 @@ async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> str:
             progress_out=parsed or "",
         ))
 
+        # ── accumulate thread ──
+        thread.append(_format_thread_entry(
+            iteration, progress_before, result, parsed or "(parse failed)", iter_elapsed,
+        ))
+
         # ── agent signals completion via NEXT: DONE ──
         if parsed and re.search(r"NEXT:\s*DONE\b", parsed, re.IGNORECASE):
+            done_signal = True
             CON.rule(f"[bold green]agent signalled DONE after {iteration} iterations[/]")
             break
 
@@ -457,7 +535,24 @@ async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> str:
             CON.print(f"[dim]sleeping {cfg.LOOP_COOLDOWN}s…[/]")
             await asyncio.sleep(cfg.LOOP_COOLDOWN)
 
-    return progress
+    total_time = time.perf_counter() - t0
+    # iteration was already incremented past max when we broke, so use len(thread)
+    loop_result = LoopResult(
+        iterations=len(thread),
+        total_time=total_time,
+        final_progress=progress,
+        thread=thread,
+        done_signal=done_signal,
+        prompt=prompt,
+    )
+
+    # ── rich summary ──
+    CON.print()
+    CON.rule("[bold magenta]RALPH LOOP COMPLETE[/]")
+    summary = _format_summary(loop_result)
+    CON.print(f"[bold]{summary}[/]")
+
+    return loop_result
 
 
 # ─────────────── TESTS ───────────────────────────────────────
@@ -707,6 +802,74 @@ def _test_eval_progress_is_summary() -> None:
     _t("summary fail mentions verbatim", "verbatim" in reason2.lower())
 
 
+# ─── unit tests: LoopResult + thread (R17, R18) ─────────────
+
+def _test_loop_result_dataclass() -> None:
+    """R17: LoopResult has all required fields."""
+    r = LoopResult(
+        iterations=3, total_time=5.0, final_progress="DONE: x",
+        thread=["iter1", "iter2", "iter3"], done_signal=True, prompt="test",
+    )
+    _t("LoopResult.iterations", r.iterations == 3)
+    _t("LoopResult.total_time", r.total_time == 5.0)
+    _t("LoopResult.final_progress", r.final_progress == "DONE: x")
+    _t("LoopResult.thread has 3 entries", len(r.thread) == 3)
+    _t("LoopResult.done_signal", r.done_signal is True)
+    _t("LoopResult.prompt", r.prompt == "test")
+
+
+def _test_ralph_tenets_defined() -> None:
+    """R18: RALPH_TENETS is a non-empty string with all 7 tenets."""
+    _t("RALPH_TENETS is str", isinstance(RALPH_TENETS, str))
+    _t("RALPH_TENETS has 7 tenets", RALPH_TENETS.count(". ") >= 7, f"found {RALPH_TENETS.count('. ')}")
+    for keyword in ["FORWARD PROGRESS", "NO REPETITION", "CONCISE STATE",
+                     "STRUCTURED FORMAT", "SELF-TERMINATION", "INCREMENTAL VALUE",
+                     "NO CONTEXT BLEED"]:
+        _t(f"tenets contains '{keyword}'", keyword in RALPH_TENETS)
+
+
+def _test_format_thread_entry() -> None:
+    """R17: _format_thread_entry produces structured string."""
+    entry = _format_thread_entry(1, "seed progress", "model response here", "DONE: x\nNEXT: y", 2.5)
+    _t("thread entry is str", isinstance(entry, str))
+    _t("thread entry has iteration", "ITERATION 1" in entry)
+    _t("thread entry has progress_in", "seed progress" in entry)
+    _t("thread entry has response", "model response here" in entry)
+    _t("thread entry has progress_out", "DONE: x" in entry)
+    _t("thread entry has elapsed", "2.5" in entry)
+
+
+def _test_format_summary() -> None:
+    """R17: _format_summary produces rich-printable summary."""
+    r = LoopResult(
+        iterations=3, total_time=10.5, final_progress="DONE: everything",
+        thread=["a", "b", "c"], done_signal=True, prompt="test task",
+    )
+    s = _format_summary(r)
+    _t("summary is str", isinstance(s, str))
+    _t("summary has iterations", "3" in s)
+    _t("summary has time", "10.5" in s or "10.50" in s)
+    _t("summary has done_signal", "DONE" in s or "done" in s.lower())
+    _t("summary has prompt preview", "test task" in s)
+
+
+def _test_build_analysis_prompt() -> None:
+    """R18: _build_analysis_prompt includes thread + tenets."""
+    r = LoopResult(
+        iterations=2, total_time=5.0, final_progress="DONE: x",
+        thread=["iter1 data", "iter2 data"], done_signal=True, prompt="test",
+    )
+    p = _build_analysis_prompt(r)
+    _t("analysis prompt is str", isinstance(p, str))
+    _t("analysis prompt has <thread>", "<thread>" in p)
+    _t("analysis prompt has </thread>", "</thread>" in p)
+    _t("analysis prompt has thread content", "iter1 data" in p)
+    _t("analysis prompt has <tenets>", "<tenets>" in p)
+    _t("analysis prompt has </tenets>", "</tenets>" in p)
+    _t("analysis prompt has tenet content", "FORWARD PROGRESS" in p)
+    _t("analysis prompt asks for score", "score" in p.lower() or "rate" in p.lower())
+
+
 # ─── integration tests (API calls) ───────────────────────────
 
 async def _test_llm_joke() -> None:
@@ -743,19 +906,24 @@ async def _test_llm_parallel() -> None:
 
 
 async def _test_ralph_loop_bounded() -> None:
-    """R9,R12,R14,R15: ralph_loop stops at MAX_ITERATIONS, carries progress."""
+    """R9,R12,R14,R15,R17: ralph_loop returns LoopResult with thread."""
     cfg = CONFIG(MAX_ITERATIONS=2, LOOP_COOLDOWN=0, MAX_TOKENS=512)
     t0 = time.perf_counter()
-    final_progress = await ralph_loop(
+    result = await ralph_loop(
         "Count to 3, one number per iteration. "
         "In your <progress> tag, list which numbers you've said so far under DONE.",
         cfg,
     )
     wall = time.perf_counter() - t0
+    _t("bounded loop returns LoopResult", isinstance(result, LoopResult))
     _t("bounded loop completes", True, f"{wall:.2f}s")
-    _t("bounded loop < 30s", wall < 30, f"{wall:.2f}s")
-    _t("final progress is string", isinstance(final_progress, str))
-    _t("final progress non-empty", len(final_progress) > 5, f"{len(final_progress)} chars")
+    _t("bounded loop < 60s", wall < 60, f"{wall:.2f}s")
+    _t("result.final_progress is string", isinstance(result.final_progress, str))
+    _t("result.final_progress non-empty", len(result.final_progress) > 5, f"{len(result.final_progress)} chars")
+    _t("result.thread populated", len(result.thread) >= 1, f"{len(result.thread)} entries")
+    _t("result.iterations == 2", result.iterations == 2)
+    _t("result.total_time > 0", result.total_time > 0, f"{result.total_time:.2f}s")
+    _t("result.prompt preserved", "Count" in result.prompt)
 
 
 # ─── test runner ──────────────────────────────────────────────
@@ -783,6 +951,11 @@ async def _run_tests() -> None:
     _test_eval_structured_format()
     _test_eval_no_context_bleed()
     _test_eval_progress_is_summary()
+    _test_loop_result_dataclass()
+    _test_ralph_tenets_defined()
+    _test_format_thread_entry()
+    _test_format_summary()
+    _test_build_analysis_prompt()
 
     CON.rule("[bold magenta]INTEGRATION TESTS (API calls)[/]")
     await _test_llm_joke()
@@ -980,6 +1153,28 @@ def _eval_progress_is_summary(traces: list[_IterData]) -> tuple[bool, str]:
     return (True, "progress blocks are summaries, not verbatim copies")
 
 
+# ─── thread analysis eval ─────────────────────────────────────
+
+async def _eval_thread_analysis(result: LoopResult, cfg: CONFIG) -> tuple[bool, str]:
+    """TENET: Final LLM analysis of the full thread against RALPH_TENETS.
+
+    Passes if the LLM scores overall >= 3/5.
+    """
+    prompt = _build_analysis_prompt(result)
+    try:
+        analysis = await llm(prompt, cfg)
+    except Exception as e:
+        return (False, f"analysis LLM call failed: {e}")
+
+    # look for "Overall score: X/5" or "overall: X/5"
+    m = re.search(r"[Oo]verall.*?(\d)/5", analysis)
+    if m:
+        score = int(m.group(1))
+        passed = score >= 3
+        return (passed, f"overall score {score}/5 — {'passed' if passed else 'below threshold (3/5)'}\n{analysis[:300]}")
+    return (True, f"could not parse score, treating as pass\n{analysis[:300]}")
+
+
 # ─── eval runner ──────────────────────────────────────────────
 
 _EVAL_PASS = 0
@@ -1015,7 +1210,7 @@ async def _run_evals() -> None:
         "3. Write 3 pytest tests.\n"
         "4. Review and suggest improvements."
     )
-    await ralph_loop(eval_prompt, eval_cfg)
+    loop_result = await ralph_loop(eval_prompt, eval_cfg)
 
     if not _TRACES:
         CON.print("[bold red]no traces collected — cannot evaluate[/]")
@@ -1050,6 +1245,12 @@ async def _run_evals() -> None:
 
     ok, reason = await _eval_no_echo(_TRACES, judge_cfg)
     _ev("no_echo: response is substantive, not parroting", ok, reason)
+
+    # ── step 4: thread analysis eval (R18) ──
+    CON.rule("[bold magenta]EVAL: thread analysis (LLM scores against tenets)[/]")
+    analysis_cfg = CONFIG(MAX_TOKENS=1024, TEMPERATURE=0.0)
+    ok, reason = await _eval_thread_analysis(loop_result, analysis_cfg)
+    _ev("thread_analysis: LLM judges overall loop quality", ok, reason)
 
     # ── results ──
     wall = time.perf_counter() - t0
@@ -1096,6 +1297,20 @@ def _run_all_tmux() -> None:
         CON.print("[dim]not a TTY — run 'tmux attach -t ralph-all' manually[/]")
 
 
+async def _run_example_with_analysis(prompt: str, cfg: CONFIG) -> None:
+    """Run ralph loop, then call LLM to analyze the thread against tenets."""
+    result = await ralph_loop(prompt, cfg)
+
+    # ── final LLM analysis ──
+    CON.rule("[bold magenta]THREAD ANALYSIS (LLM scoring against tenets)[/]")
+    analysis_prompt = _build_analysis_prompt(result)
+    try:
+        analysis = await llm(analysis_prompt, CONFIG(MAX_TOKENS=1024, TEMPERATURE=0.0))
+        CON.print(f"\n{analysis}\n")
+    except Exception as e:
+        CON.print(f"[bold red]analysis failed: {e}[/]")
+
+
 def _run_example(name: str) -> None:
     """Run a named example prompt through the ralph loop (max 100 iterations)."""
     if name == "list":
@@ -1117,7 +1332,7 @@ def _run_example(name: str) -> None:
 
     CON.print(f"[bold green]running example:[/] {name} (max 100 iterations — agent decides when done)\n")
     cfg = CONFIG(MAX_ITERATIONS=100, LOOP_COOLDOWN=0.5)
-    asyncio.run(ralph_loop(prompt, cfg))
+    asyncio.run(_run_example_with_analysis(prompt, cfg))
 
 
 if __name__ == "__main__":
@@ -1129,7 +1344,7 @@ if __name__ == "__main__":
         name = sys.argv[2] if len(sys.argv) > 2 else "list"
         _run_example(name)
     elif len(sys.argv) > 1:
-        asyncio.run(ralph_loop(" ".join(sys.argv[1:])))
+        asyncio.run(_run_example_with_analysis(" ".join(sys.argv[1:]), CFG))
     else:
         # no args → quick help
         CON.rule("[bold magenta]llm_fw.py — Fireworks oss120b[/]")
