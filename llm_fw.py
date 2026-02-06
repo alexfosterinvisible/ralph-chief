@@ -379,21 +379,14 @@ async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> str:
             f"ITERATION: {iteration} of {bound}\n"
         )
 
-        # ── show full prompt + validate progress injection ──
-        CON.print(f"\n[bold yellow]{'─'*60}[/]")
-        CON.print(f"[bold yellow]FULL PROMPT ({len(full_prompt)} chars):[/]")
-        CON.print(f"[bold yellow]{'─'*60}[/]")
-        CON.print(full_prompt)
-        CON.print(f"[bold yellow]{'─'*60}[/]\n")
-
-        if "<progress>" not in full_prompt or "</progress>" not in full_prompt:
-            CON.print("[bold red]⚠ WARNING: <progress> tag NOT found in assembled prompt! Progress injection FAILED.[/]")
+        # ── validate progress injection ──
+        progress_tag = f"<progress>\n{progress}\n</progress>"
+        if progress_tag not in full_prompt:
+            CON.print("[bold red]⚠ WARNING: progress NOT injected into prompt! Injection FAILED.[/]")
+        elif not progress.strip():
+            CON.print("[bold red]⚠ WARNING: progress is EMPTY! Injection FAILED.[/]")
         else:
-            injected = _parse_progress(full_prompt)
-            if not injected or not injected.strip():
-                CON.print("[bold red]⚠ WARNING: <progress> tag is EMPTY in assembled prompt! Progress injection FAILED.[/]")
-            else:
-                CON.print(f"[bold green]✓ progress injected[/] [dim]({len(injected)} chars)[/]")
+            CON.print(f"[bold green]✓ progress injected:[/] {progress[:200]}{'…' if len(progress)>200 else ''}")
 
         # ── call LLM with retry on missing <progress> tag ──
         result: str = ""
@@ -676,6 +669,21 @@ def _test_eval_no_context_bleed() -> None:
     _t("no_bleed fail mentions bleed", "bleed" in reason2.lower())
 
 
+def _test_eval_progress_is_summary() -> None:
+    """R16: programmatic progress_is_summary check."""
+    # ── good: progress is a short summary, not in response ──
+    good = [_IterData(1, "", "Here is my detailed analysis of the code...", "DONE: analyzed code\nNEXT: write tests")]
+    ok, _ = _eval_progress_is_summary(good)
+    _t("summary good passes", ok)
+
+    # ── bad: progress contains 60+ char verbatim copy from response ──
+    long_text = "This is a very long and specific piece of text that should only appear in the response body"
+    bad = [_IterData(1, "", f"Response: {long_text} more stuff", f"DONE: {long_text}")]
+    ok2, reason2 = _eval_progress_is_summary(bad)
+    _t("summary verbatim copy fails", not ok2)
+    _t("summary fail mentions verbatim", "verbatim" in reason2.lower())
+
+
 # ─── integration tests (API calls) ───────────────────────────
 
 async def _test_llm_joke() -> None:
@@ -751,6 +759,7 @@ async def _run_tests() -> None:
     _test_eval_concise_progress()
     _test_eval_structured_format()
     _test_eval_no_context_bleed()
+    _test_eval_progress_is_summary()
 
     CON.rule("[bold magenta]INTEGRATION TESTS (API calls)[/]")
     await _test_llm_joke()
@@ -925,20 +934,27 @@ async def _eval_no_echo(traces: list[_IterData], cfg: CONFIG) -> tuple[bool, str
     return await _judge_with_retry(prompt, cfg)
 
 
-async def _eval_progress_is_summary(traces: list[_IterData], cfg: CONFIG) -> tuple[bool, str]:
-    """TENET: Progress is a concise SUMMARY, not a copy of the response."""
-    data = _fmt_traces(traces)
-    prompt = _judge_prompt(
-        "progress_is_summary_not_copy",
-        (
-            "The <progress> block should be a SHORT summary of state — what's done, what's next. "
-            "It must NOT be a verbatim copy or large excerpt of the response text. "
-            "Think of it as a sticky note, not a transcript. "
-            "If progress_out looks like it contains paragraphs of response text, that's a FAIL."
-        ),
-        data,
-    )
-    return await _judge_with_retry(prompt, cfg)
+def _eval_progress_is_summary(traces: list[_IterData]) -> tuple[bool, str]:
+    """TENET: Progress is a concise SUMMARY, not a copy of the response.
+
+    Programmatic check: no contiguous 60+ char substring from progress_out
+    should appear verbatim in the response body (excluding the <progress>
+    tag itself, since the response naturally contains it).
+    """
+    CHUNK = 60  # min verbatim overlap to flag
+    for t in traces:
+        if not t.progress_out or not t.response:
+            continue
+        # strip the <progress>...</progress> block from the response before checking
+        resp_stripped = _PROGRESS_RE.sub("", t.response).strip()
+        if not resp_stripped:
+            continue
+        # slide a window of CHUNK chars across progress_out, check if in response body
+        for i in range(len(t.progress_out) - CHUNK + 1):
+            snippet = t.progress_out[i:i + CHUNK]
+            if snippet in resp_stripped:
+                return (False, f"iteration {t.iteration}: progress contains 60+ char verbatim excerpt from response body")
+    return (True, "progress blocks are summaries, not verbatim copies")
 
 
 # ─── eval runner ──────────────────────────────────────────────
@@ -996,6 +1012,9 @@ async def _run_evals() -> None:
     ok, reason = _eval_no_context_bleed(_TRACES)
     _ev("no_context_bleed: progress < 50% of response", ok, reason)
 
+    ok, reason = _eval_progress_is_summary(_TRACES)
+    _ev("progress_is_summary: sticky note, not transcript", ok, reason)
+
     # ── step 3: LLM judge tenets ──
     CON.rule("[bold magenta]EVAL: LLM judge tenets[/]")
     judge_cfg = CONFIG(MAX_TOKENS=256, TEMPERATURE=0.0)
@@ -1008,9 +1027,6 @@ async def _run_evals() -> None:
 
     ok, reason = await _eval_no_echo(_TRACES, judge_cfg)
     _ev("no_echo: response is substantive, not parroting", ok, reason)
-
-    ok, reason = await _eval_progress_is_summary(_TRACES, judge_cfg)
-    _ev("progress_is_summary: sticky note, not transcript", ok, reason)
 
     # ── results ──
     wall = time.perf_counter() - t0
