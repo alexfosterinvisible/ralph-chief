@@ -2,34 +2,82 @@
 """Fireworks oss120b LLM caller + ralph loop — no tool-use.
 
 Usage:
-    uv run llm_fw.py "your prompt here"       # ralph loop
+    uv run llm_fw.py "your prompt here"       # ralph loop + thread analysis
     uv run llm_fw.py --example algorithm      # run one example (agent decides when done)
     uv run llm_fw.py --example all            # tmux grid: all examples in parallel
     uv run llm_fw.py --example list           # list available examples
+    uv run llm_fw.py --kill                   # kill tmux ralph-all session
     uv run llm_fw.py --tests                  # run all tests (unit + integration)
     uv run llm_fw.py --eval                   # LLM-judge tenet evaluations
     uv run llm_fw.py                          # quick help
 
 Requirements:
-☑️ R1: Call gpt-oss-120b on Fireworks via OpenAI-compatible API
-☑️ R2: class CONFIG with all tunable params
-☑️ R3: def llm(prompt, config=CONFIG) → str
-☑️ R4: Handle rate limits (60 req/min, 12k gen tok/min, 60k prompt tok/min)
-☑️ R5: asyncio.Semaphore on global var for cross-async safety
-☑️ R6: tenacity exp-backoff retries up to 3
-☑️ R7: Rich prints w/ color for everything
-☑️ R8: Streaming for fast TTFT
-☑️ R9: ralph_loop(prompt) — while-true loop, logs per-commit
-☑️ R10: AGENT_PROMPT in CONFIG, read fresh each iteration
-☑️ R11: PROMPTS class w/ example prompts (tuple format)
-☑️ R12: MAX_ITERATIONS for bounded loop runs (0 = infinite)
-☑️ R13: --tests runs all unit + integration tests in-file
-☑️ R14: <progress> tag parsing with regex, retry on failure
-☑️ R15: PROGRESS carried between iterations as prompt injection
-☑️ R16: --eval LLM-judge tenet evals (programmatic + judge, PASS|FAIL structured output)
-☑️ R17: LoopResult dataclass returned from ralph_loop, THREAD[] accumulates stdout per iteration
-☑️ R18: Final LLM analysis of THREAD against RALPH_TENETS, rich summary at end of loop
-⛔ Tool-use / function-calling
+
+<R1> LLM API layer
+  ☑️✅🧪 <R1.1> Call gpt-oss-120b on Fireworks via OpenAI-compatible API
+  ☑️✅🧪 <R1.2> Streaming for fast TTFT — tokens printed live to terminal
+  ☑️✅🧪 <R1.3> Compact summary line after stream (chars, TTFT, total time)
+
+<R2> Configuration
+  ☑️✅🧪 <R2.1> @dataclass CONFIG with all tunable params (model, generation, rate-limit, retry, loop)
+  ☑️✅🧪 <R2.2> CONFIG overridable per-call (e.g. CONFIG(MAX_TOKENS=512))
+  ☑️✅    <R2.3> AGENT_PROMPT in CONFIG — no-tool-use prompt w/ progress tag instructions
+  ☑️✅    <R2.4> AGENT_PROMPT_FILE overrides CONFIG.AGENT_PROMPT if file exists on disk
+
+<R3> Public API
+  ☑️✅🧪 <R3.1> async def llm(prompt, config=CONFIG) → str
+  ☑️✅🧪 <R3.2> asyncio.Semaphore on lazy global for cross-async safety
+  ☑️✅🧪 <R3.3> tenacity exp-backoff retries up to MAX_RETRIES
+
+<R4> Rate limits
+  ☑️✅    <R4.1> Respect 60 req/min, 12k gen tok/min, 60k prompt tok/min
+  ☑️✅🧪 <R4.2> MAX_CONCURRENT semaphore cap (default 10)
+
+<R5> Ralph loop (core)
+  ☑️✅🧪 <R5.1> ralph_loop(prompt) — while-true loop, logs per-commit
+  ☑️✅🧪 <R5.2> MAX_ITERATIONS for bounded loops (0 = infinite)
+  ☑️✅🧪 <R5.3> <progress> tag parsing with regex (_PROGRESS_RE)
+  ☑️✅🧪 <R5.4> Retry on missing <progress> tag (PROGRESS_RETRIES)
+  ☑️✅🧪 <R5.5> Progress injected into next iteration's prompt
+  ☑️✅    <R5.6> Red warning if progress injection fails or is empty
+  ☑️✅🧪 <R5.7> Agent self-termination via NEXT: DONE
+  ☑️✅    <R5.8> Per-iteration logfile written to AGENT_LOGS_DIR
+
+<R6> LoopResult + thread
+  ☑️✅🧪 <R6.1> LoopResult dataclass (iterations, total_time, final_progress, thread[], done_signal, prompt)
+  ☑️✅🧪 <R6.2> THREAD[] accumulates _format_thread_entry per iteration
+  ☑️✅🧪 <R6.3> Rich summary printed at end of every loop (_format_summary)
+
+<R7> Thread analysis
+  ☑️✅🧪 <R7.1> RALPH_TENETS — 7 tenets as reusable string
+  ☑️✅🧪 <R7.2> _build_analysis_prompt — wraps <thread> + <tenets>, asks LLM to score 1-5
+  ☑️✅    <R7.3> Analysis runs automatically after examples and free-form prompts
+
+<R8> Examples
+  ☑️✅    <R8.1> PROMPTS singleton class w/ 5 self-contained examples (tuple format)
+  ☑️✅    <R8.2> --example NAME runs single example (max 100 iters, agent decides when done)
+  ☑️✅    <R8.3> --example list shows available examples
+  ☑️✅    <R8.4> --example all — tmux pane grid, all examples in parallel
+  ☑️✅    <R8.5> --kill — kill tmux ralph-all session
+
+<R9> Testing
+  ☑️✅🧪 <R9.1> --tests runs unit + integration tests in-file (116 tests)
+  ☑️✅🧪 <R9.2> Unit tests: CONFIG, PROMPTS, git, agent prompt, logfile, semaphore, progress parse
+  ☑️✅🧪 <R9.3> Unit tests: eval functions (concise, structured, no_bleed, summary)
+  ☑️✅🧪 <R9.4> Unit tests: LoopResult, RALPH_TENETS, thread entry, summary, analysis prompt
+  ☑️✅🧪 <R9.5> Integration tests: llm call, long input, parallel, ralph_loop bounded
+
+<R10> Evals
+  ☑️✅🧪 <R10.1> --eval runs programmatic + LLM-judge tenet evals
+  ☑️✅🧪 <R10.2> Programmatic: concise_progress, structured_format, no_context_bleed, progress_is_summary
+  ☑️✅🧪 <R10.3> LLM judge: incremental_value, forward_motion, no_echo
+  ☑️✅🧪 <R10.4> Thread analysis eval: overall X/5 score, per-tenet breakdown
+
+<R11> Display
+  ☑️✅    <R11.1> Rich prints w/ color for all output
+  ☑️✅    <R11.2> --help (no args) shows all CLI commands
+
+⛔ Tool-use / function-calling (model has none, prompts are self-contained)
 """
 # /// script
 # requires-python = ">=3.12"
