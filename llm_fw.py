@@ -3,7 +3,8 @@
 
 Usage:
     uv run llm_fw.py "your prompt here"       # ralph loop
-    uv run llm_fw.py --example algorithm      # run example (agent decides when done)
+    uv run llm_fw.py --example algorithm      # run one example (agent decides when done)
+    uv run llm_fw.py --example all            # tmux grid: all examples in parallel
     uv run llm_fw.py --example list           # list available examples
     uv run llm_fw.py --tests                  # run all tests (unit + integration)
     uv run llm_fw.py --eval                   # LLM-judge tenet evaluations
@@ -1062,6 +1063,39 @@ async def _run_evals() -> None:
 
 # ─────────────── EXAMPLE RUNNER / GUARDMAIN ──────────────────
 
+def _run_all_tmux() -> None:
+    """Launch all examples in a tmux pane grid, one per pane, in parallel."""
+    names = PROMPTS.names()
+    session = "ralph-all"
+    script = os.path.abspath(__file__)
+
+    # kill stale session if exists
+    subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
+
+    # create session with first example
+    subprocess.run([
+        "tmux", "new-session", "-d", "-s", session, "-x", "220", "-y", "60",
+        f"uv run {script} --example {names[0]}; read",
+    ], check=True)
+
+    # split panes for remaining examples
+    for n in names[1:]:
+        subprocess.run([
+            "tmux", "split-window", "-t", session,
+            f"uv run {script} --example {n}; read",
+        ], check=True)
+        # rebalance after each split to keep grid tidy
+        subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], check=True)
+
+    # attach (or print instructions if not a TTY)
+    CON.print(f"[bold green]launched {len(names)} examples in tmux session '{session}'[/]")
+    CON.print(f"[dim]attach: tmux attach -t {session}  |  kill: tmux kill-session -t {session}[/]")
+    if sys.stdout.isatty():
+        os.execvp("tmux", ["tmux", "attach", "-t", session])
+    else:
+        CON.print("[dim]not a TTY — run 'tmux attach -t ralph-all' manually[/]")
+
+
 def _run_example(name: str) -> None:
     """Run a named example prompt through the ralph loop (max 100 iterations)."""
     if name == "list":
@@ -1071,10 +1105,14 @@ def _run_example(name: str) -> None:
             CON.print(f"  [bold cyan]{n:<20}[/] {preview}…")
         return
 
+    if name == "all":
+        _run_all_tmux()
+        return  # unreachable — execvp replaces process
+
     prompt = PROMPTS.get(name)
     if not prompt:
         CON.print(f"[bold red]unknown example:[/] {name}")
-        CON.print(f"[dim]available: {', '.join(PROMPTS.names())}[/]")
+        CON.print(f"[dim]available: {', '.join(PROMPTS.names())}  |  all[/]")
         sys.exit(1)
 
     CON.print(f"[bold green]running example:[/] {name} (max 100 iterations — agent decides when done)\n")
@@ -1099,4 +1137,5 @@ if __name__ == "__main__":
         CON.print("  [bold cyan]uv run llm_fw.py --tests[/]          run all tests")
         CON.print("  [bold cyan]uv run llm_fw.py --eval[/]           LLM-judge tenet evals")
         CON.print("  [bold cyan]uv run llm_fw.py --example list[/]   list example prompts")
-        CON.print("  [bold cyan]uv run llm_fw.py --example NAME[/]   run example (3 iters)")
+        CON.print("  [bold cyan]uv run llm_fw.py --example NAME[/]   run example")
+        CON.print("  [bold cyan]uv run llm_fw.py --example all[/]    tmux grid: all in parallel")
