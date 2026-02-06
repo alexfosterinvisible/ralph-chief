@@ -1340,6 +1340,10 @@ if __name__ == "__main__":
         asyncio.run(_run_tests())
     elif len(sys.argv) > 1 and sys.argv[1] == "--eval":
         asyncio.run(_run_evals())
+    elif len(sys.argv) > 1 and sys.argv[1] == "--kill":
+        r = subprocess.run(["tmux", "kill-session", "-t", "ralph-all"], capture_output=True)
+        CON.print("[bold green]killed tmux session 'ralph-all'[/]" if r.returncode == 0
+                  else "[dim]no 'ralph-all' session running[/]")
     elif len(sys.argv) > 1 and sys.argv[1] == "--example":
         name = sys.argv[2] if len(sys.argv) > 2 else "list"
         _run_example(name)
@@ -1354,3 +1358,4 @@ if __name__ == "__main__":
         CON.print("  [bold cyan]uv run llm_fw.py --example list[/]   list example prompts")
         CON.print("  [bold cyan]uv run llm_fw.py --example NAME[/]   run example")
         CON.print("  [bold cyan]uv run llm_fw.py --example all[/]    tmux grid: all in parallel")
+        CON.print("  [bold cyan]uv run llm_fw.py --kill[/]            kill tmux 'ralph-all' session")
