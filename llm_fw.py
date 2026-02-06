@@ -4,12 +4,22 @@
 Usage:
     uv run llm_fw.py "your prompt here"       # ralph loop + thread analysis
     uv run llm_fw.py --example algorithm      # run one example (agent decides when done)
-    uv run llm_fw.py --example all            # tmux grid: all examples in parallel
+    uv run llm_fw.py --example all            # tmux grid: all 8 examples in parallel
     uv run llm_fw.py --example list           # list available examples
-    uv run llm_fw.py --kill                   # kill tmux ralph-all session
+    uv run llm_fw.py --kill                   # kill tmux 'ralph-all' session
     uv run llm_fw.py --tests                  # run all tests (unit + integration)
     uv run llm_fw.py --eval                   # LLM-judge tenet evaluations
     uv run llm_fw.py                          # quick help
+
+Examples (progressive difficulty):
+    1. fizzbuzz       — trivial one-shot (~1 iter)
+    2. algorithm      — binary heap priority queue (~1-2 iters)
+    3. bug_hunt       — trace empty-response bug (~2 iters)
+    4. feature_design — circuit breaker design (~2-3 iters)
+    5. refactor       — CONFIG dataclass redesign (~3 iters)
+    6. architecture   — parallel agent system (~4-5 iters)
+    7. interpreter    — calculator language w/ lexer/parser/eval (~5-7 iters)
+    8. full_system    — distributed task queue system (MANY iters)
 
 Requirements:
 
@@ -101,6 +111,8 @@ from pathlib import Path
 
 from openai import AsyncOpenAI, RateLimitError, APIStatusError
 from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -187,24 +199,32 @@ CFG = CONFIG()
 # Usage: uv run llm_fw.py --example <name>
 
 class PROMPTS:
-    """Example prompts that exercise the ralph loop sensibly."""
+    """Example prompts — progressively harder. 1=easy (~1 iter), 8=hard (many)."""
 
     # ── All prompts are SELF-CONTAINED: no file access, no tool-use. ──
-    # ── The model must be able to complete the task using ONLY this text. ──
+    # ── The model must complete the task using ONLY this text. ──
+    # ── Ordered by expected difficulty / iteration count. ──
 
-    # ── feature design: plan a new capability (pure reasoning) ──
-    feature_design = (
-        "Design a retry-with-circuit-breaker for an async Python LLM caller.\n"
-        "1. Define the state machine: CLOSED → OPEN → HALF-OPEN.\n"
-        "2. Specify thresholds: failure count, timeout, half-open probe.\n"
-        "3. Write the Python dataclass for CircuitBreaker state.\n"
-        "4. Write the async wrapper function with full type hints.\n"
-        "5. Write 3 unit tests (pytest style) covering each transition.\n"
-        # each iteration should produce deeper / more refined output
-        "6. STATUS: what's designed, what needs refinement, what's next."
+    # ── 1. trivial: one-shot answer (~1 iter) ──
+    fizzbuzz = (
+        "Write FizzBuzz in Python for 1 to 100.\n"
+        "1. Print 'Fizz' for multiples of 3, 'Buzz' for 5, 'FizzBuzz' for both.\n"
+        "2. Write 3 pytest tests covering the key cases.\n"
+        "3. STATUS: done or not."
     )
 
-    # ── bug analysis: trace a hypothetical data flow (pure reasoning) ──
+    # ── 2. easy: small algorithm (~1-2 iters) ──
+    algorithm = (
+        "Implement a priority queue backed by a binary heap in Python.\n"
+        "1. Write the class with push, pop, peek, and __len__.\n"
+        "2. Use a list as the backing store, no heapq import.\n"
+        "3. Support (priority, item) tuples, lower priority = higher urgency.\n"
+        "4. Write 5 pytest tests covering: empty pop, ordering, duplicates, peek, len.\n"
+        "5. Analyze time complexity for each operation.\n"
+        "6. STATUS: implementation complete? tests pass? edge cases covered?"
+    )
+
+    # ── 3. easy-medium: trace a bug (~2 iters) ──
     bug_hunt = (
         "A streaming LLM API sometimes returns empty text. The code does:\n"
         "  chunks = []\n"
@@ -218,7 +238,18 @@ class PROMPTS:
         "4. STATUS: root causes found, fixes proposed, confidence level."
     )
 
-    # ── refactor: redesign a dataclass (code provided inline) ──
+    # ── 4. medium: design a component (~2-3 iters) ──
+    feature_design = (
+        "Design a retry-with-circuit-breaker for an async Python LLM caller.\n"
+        "1. Define the state machine: CLOSED → OPEN → HALF-OPEN.\n"
+        "2. Specify thresholds: failure count, timeout, half-open probe.\n"
+        "3. Write the Python dataclass for CircuitBreaker state.\n"
+        "4. Write the async wrapper function with full type hints.\n"
+        "5. Write 3 unit tests (pytest style) covering each transition.\n"
+        "6. STATUS: what's designed, what needs refinement, what's next."
+    )
+
+    # ── 5. medium: refactor existing code (~3 iters) ──
     refactor = (
         "Refactor this CONFIG dataclass:\n\n"
         "  @dataclass\n"
@@ -241,25 +272,55 @@ class PROMPTS:
         "5. STATUS: what changed, what's cleaner, backwards-compat notes."
     )
 
-    # ── architecture: design a multi-agent system (pure reasoning) ──
+    # ── 6. hard: system architecture (~4-5 iters) ──
     architecture = (
         "Design a parallel agent system for autonomous coding (no tool-use required).\n"
         "1. Define the coordination protocol: task locks, git sync, conflict resolution.\n"
         "2. Sketch the Docker container setup for N parallel agents.\n"
         "3. Write the AGENT_PROMPT.md content that each agent reads.\n"
         "4. Write the bash harness (while-true loop + git push/pull).\n"
-        "5. STATUS: architecture complete? gaps? next steps?"
+        "5. Design the failure recovery: agent crash, merge conflict, deadlock.\n"
+        "6. Write a monitoring dashboard design (what metrics, how displayed).\n"
+        "7. STATUS: architecture complete? gaps? next steps?"
     )
 
-    # ── algorithm: implement from scratch (pure reasoning) ──
-    algorithm = (
-        "Implement a priority queue backed by a binary heap in Python.\n"
-        "1. Write the class with push, pop, peek, and __len__.\n"
-        "2. Use a list as the backing store, no heapq import.\n"
-        "3. Support (priority, item) tuples, lower priority = higher urgency.\n"
-        "4. Write 5 pytest tests covering: empty pop, ordering, duplicates, peek, len.\n"
-        "5. Analyze time complexity for each operation.\n"
-        "6. STATUS: implementation complete? tests pass? edge cases covered?"
+    # ── 7. hard: build an interpreter (~5-7 iters) ──
+    interpreter = (
+        "Build a calculator language interpreter in Python.\n"
+        "The language supports: integers, floats, +, -, *, /, parentheses,\n"
+        "variable assignment (let x = 5), and if/else expressions.\n\n"
+        "1. Write a Lexer class that tokenizes input strings.\n"
+        "2. Write a Parser class that builds an AST from tokens.\n"
+        "3. Write an Evaluator class that walks the AST and computes results.\n"
+        "4. Support these expressions:\n"
+        "   - '2 + 3 * 4' → 14\n"
+        "   - 'let x = 10; x * 2' → 20\n"
+        "   - 'if 1 > 0 then 42 else 0' → 42\n"
+        "5. Write 8 pytest tests covering: arithmetic, precedence, variables,\n"
+        "   if/else, nested parens, division by zero, syntax errors.\n"
+        "6. Add error messages with line/column info.\n"
+        "7. STATUS: what works, what's missing, what edge cases remain."
+    )
+
+    # ── 8. very hard: full system design (MANY iters) ──
+    full_system = (
+        "Design and implement a complete distributed task queue system in Python.\n\n"
+        "COMPONENTS (all must be fully coded, not just sketched):\n"
+        "1. TaskQueue class: submit(task), get_next(), complete(task_id), fail(task_id, reason).\n"
+        "2. Worker class: polls queue, executes tasks, reports results.\n"
+        "3. Scheduler: priority-based, with retry logic (3 attempts, exp backoff).\n"
+        "4. Dead-letter queue: tasks that fail 3x are moved here.\n"
+        "5. Concurrency: support N workers processing in parallel (asyncio).\n"
+        "6. Persistence: tasks survive restart (use sqlite3, no external deps).\n"
+        "7. Monitoring: track task counts by state (pending/running/done/failed/dead).\n"
+        "8. CLI: submit, status, drain, purge-dead commands.\n\n"
+        "ACCEPTANCE CRITERIA:\n"
+        "- All classes fully implemented with type hints and docstrings.\n"
+        "- 10+ pytest tests covering: submit/get, priority ordering, retry logic,\n"
+        "  dead-letter, concurrent workers, persistence across restart, monitoring.\n"
+        "- Error handling: worker crash, db corruption, duplicate task IDs.\n"
+        "- The design must be explained: why each decision, tradeoffs considered.\n\n"
+        "STATUS: what's built, what's tested, what needs work."
     )
 
     @classmethod
@@ -400,18 +461,24 @@ def _format_thread_entry(iteration: int, progress_in: str, response: str,
     )
 
 
-def _format_summary(r: LoopResult) -> str:
-    """Build a plain-text summary of a LoopResult for rich printing."""
-    status = "agent signalled DONE" if r.done_signal else "hit iteration limit"
-    return (
-        f"RALPH LOOP SUMMARY\n"
-        f"  prompt:      {r.prompt[:80]}{'…' if len(r.prompt) > 80 else ''}\n"
-        f"  iterations:  {r.iterations}\n"
-        f"  total time:  {r.total_time:.2f}s\n"
-        f"  status:      {status}\n"
-        f"  thread size: {len(r.thread)} entries\n"
-        f"  final progress:\n{r.final_progress}\n"
-    )
+def _format_summary(r: LoopResult) -> Panel:
+    """Build a Rich Panel with summary table for a LoopResult."""
+    status = "[bold green]DONE[/] — agent signalled completion" if r.done_signal \
+        else "[yellow]LIMIT[/] — hit iteration cap"
+    avg = r.total_time / max(r.iterations, 1)
+
+    tbl = Table(show_header=False, box=None, padding=(0, 2))
+    tbl.add_column("key", style="bold cyan", width=16)
+    tbl.add_column("value")
+    tbl.add_row("Prompt", r.prompt[:100] + ("…" if len(r.prompt) > 100 else ""))
+    tbl.add_row("Iterations", str(r.iterations))
+    tbl.add_row("Total time", f"{r.total_time:.2f}s")
+    tbl.add_row("Avg / iter", f"{avg:.2f}s")
+    tbl.add_row("Status", status)
+    tbl.add_row("Thread size", f"{len(r.thread)} entries")
+    tbl.add_row("Final progress", r.final_progress)
+
+    return Panel(tbl, title="[bold magenta]RALPH LOOP SUMMARY[/]", border_style="magenta")
 
 
 def _build_analysis_prompt(r: LoopResult) -> str:
@@ -596,9 +663,7 @@ async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> LoopResult:
 
     # ── rich summary ──
     CON.print()
-    CON.rule("[bold magenta]RALPH LOOP COMPLETE[/]")
-    summary = _format_summary(loop_result)
-    CON.print(f"[bold]{summary}[/]")
+    CON.print(_format_summary(loop_result))
 
     return loop_result
 
@@ -651,7 +716,7 @@ def _test_config_override() -> None:
 def _test_prompts_class() -> None:
     """R11: PROMPTS has entries and lookup works."""
     names = PROMPTS.names()
-    _t("PROMPTS has >=3 entries", len(names) >= 3, f"found {len(names)}")
+    _t("PROMPTS has 8 entries", len(names) == 8, f"found {len(names)}")
     _t("PROMPTS.get('feature_design') returns str", isinstance(PROMPTS.get("feature_design"), str))
     _t("PROMPTS.get('nonexistent') returns None", PROMPTS.get("nonexistent") is None)
     for n in names:
@@ -888,16 +953,22 @@ def _test_format_thread_entry() -> None:
 
 
 def _test_format_summary() -> None:
-    """R17: _format_summary produces rich-printable summary."""
+    """R17: _format_summary produces Rich Panel with summary table."""
+    from io import StringIO
     r = LoopResult(
         iterations=3, total_time=10.5, final_progress="DONE: everything",
         thread=["a", "b", "c"], done_signal=True, prompt="test task",
     )
-    s = _format_summary(r)
-    _t("summary is str", isinstance(s, str))
+    panel = _format_summary(r)
+    _t("summary is Panel", isinstance(panel, Panel))
+    # render to plain text for content checks
+    buf = StringIO()
+    Console(file=buf, width=120, no_color=True).print(panel)
+    s = buf.getvalue()
     _t("summary has iterations", "3" in s)
     _t("summary has time", "10.5" in s or "10.50" in s)
-    _t("summary has done_signal", "DONE" in s or "done" in s.lower())
+    _t("summary has avg/iter", "3.50" in s)
+    _t("summary has done status", "DONE" in s)
     _t("summary has prompt preview", "test task" in s)
 
 
@@ -1313,7 +1384,14 @@ async def _run_evals() -> None:
 # ─────────────── EXAMPLE RUNNER / GUARDMAIN ──────────────────
 
 def _run_all_tmux() -> None:
-    """Launch all examples in a tmux pane grid, one per pane, in parallel."""
+    """Launch all examples in a tmux pane grid, one per pane, in parallel.
+
+    Optimizations vs naive approach:
+    - Create all panes FIRST, layout ONCE (not N-1 layout recalculations)
+    - remain-on-exit instead of `; read` (no extra shell overhead)
+    - Stagger launches 0.3s apart to avoid rate-limit burst
+    - Reduce tmux rendering overhead with minimal status bar
+    """
     names = PROMPTS.names()
     session = "ralph-all"
     script = os.path.abspath(__file__)
@@ -1321,20 +1399,33 @@ def _run_all_tmux() -> None:
     # kill stale session if exists
     subprocess.run(["tmux", "kill-session", "-t", session], capture_output=True)
 
-    # create session with first example
+    # create session with remain-on-exit so panes stay after command finishes
     subprocess.run([
         "tmux", "new-session", "-d", "-s", session, "-x", "220", "-y", "60",
-        f"uv run {script} --example {names[0]}; read",
     ], check=True)
+    # set session-level options to reduce jitter
+    for opt in [
+        ["set-option", "-t", session, "remain-on-exit", "on"],
+        ["set-option", "-t", session, "status", "off"],
+    ]:
+        subprocess.run(["tmux"] + opt, capture_output=True)
 
-    # split panes for remaining examples
-    for n in names[1:]:
+    # create all panes first (one already exists from new-session)
+    for _ in names[1:]:
         subprocess.run([
             "tmux", "split-window", "-t", session,
-            f"uv run {script} --example {n}; read",
         ], check=True)
-        # rebalance after each split to keep grid tidy
-        subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], check=True)
+
+    # single layout pass — no per-split rebalancing
+    subprocess.run(["tmux", "select-layout", "-t", session, "tiled"], check=True)
+
+    # now send commands to each pane with staggered starts
+    for i, n in enumerate(names):
+        delay = f"sleep {i * 0.3:.1f} && " if i > 0 else ""
+        subprocess.run([
+            "tmux", "send-keys", "-t", f"{session}:{0}.{i}",
+            f"{delay}uv run {script} --example {n}", "Enter",
+        ], check=True)
 
     # attach (or print instructions if not a TTY)
     CON.print(f"[bold green]launched {len(names)} examples in tmux session '{session}'[/]")
