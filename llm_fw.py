@@ -6,7 +6,8 @@ Usage:
     uv run llm_fw.py --example code_review    # run example prompt (3 iters)
     uv run llm_fw.py --example list           # list available examples
     uv run llm_fw.py --tests                  # run all tests (unit + integration)
-    uv run llm_fw.py                          # smoke-test demo
+    uv run llm_fw.py --eval                   # LLM-judge tenet evaluations
+    uv run llm_fw.py                          # quick help
 
 Requirements:
 ☑️ R1: Call gpt-oss-120b on Fireworks via OpenAI-compatible API
@@ -24,6 +25,7 @@ Requirements:
 ☑️ R13: --tests runs all unit + integration tests in-file
 ☑️ R14: <progress> tag parsing with regex, retry on failure
 ☑️ R15: PROGRESS carried between iterations as prompt injection
+☑️ R16: --eval LLM-judge tenet evals (programmatic + judge, PASS|FAIL structured output)
 ⛔ Tool-use / function-calling
 """
 # /// script
@@ -270,6 +272,19 @@ async def llm(prompt: str, cfg: CONFIG = CFG) -> str:
     return await _call(prompt, cfg)
 
 
+# ─────────────── ITERATION TRACE (for evals) ─────────────────
+
+@dataclass
+class _IterData:
+    """One iteration's data, collected for eval/judge."""
+    iteration: int
+    progress_in: str
+    response: str
+    progress_out: str  # "" if parse failed
+
+_TRACES: list[_IterData] = []
+
+
 # ─────────────── PROGRESS PARSER ─────────────────────────────
 
 _PROGRESS_RE = re.compile(r"<progress>(.*?)</progress>", re.DOTALL | re.IGNORECASE)
@@ -343,7 +358,7 @@ async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> str:
         logfile = Path(cfg.AGENT_LOGS_DIR) / f"agent_{commit}_{iteration:04d}.log"
 
         CON.rule(f"[bold cyan]iteration {iteration}/{bound}  |  {commit}[/]")
-        CON.print(f"[dim]progress in:[/] {progress[:200]}{'…' if len(progress)>200 else ''}")
+        progress_before = progress  # snapshot for trace
 
         # ── build prompt: agent instructions + progress + user task ──
         agent_prompt = _read_agent_prompt(cfg)
@@ -357,7 +372,24 @@ async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> str:
             f"ITERATION: {iteration} of {bound}\n"
         )
 
+        # ── show full prompt + validate progress injection ──
+        CON.print(f"\n[bold yellow]{'─'*60}[/]")
+        CON.print(f"[bold yellow]FULL PROMPT ({len(full_prompt)} chars):[/]")
+        CON.print(f"[bold yellow]{'─'*60}[/]")
+        CON.print(full_prompt)
+        CON.print(f"[bold yellow]{'─'*60}[/]\n")
+
+        if "<progress>" not in full_prompt or "</progress>" not in full_prompt:
+            CON.print("[bold red]⚠ WARNING: <progress> tag NOT found in assembled prompt! Progress injection FAILED.[/]")
+        else:
+            injected = _parse_progress(full_prompt)
+            if not injected or not injected.strip():
+                CON.print("[bold red]⚠ WARNING: <progress> tag is EMPTY in assembled prompt! Progress injection FAILED.[/]")
+            else:
+                CON.print(f"[bold green]✓ progress injected[/] [dim]({len(injected)} chars)[/]")
+
         # ── call LLM with retry on missing <progress> tag ──
+        result: str = ""
         parsed: str | None = None
         for attempt in range(1 + cfg.PROGRESS_RETRIES):
             try:
@@ -377,12 +409,19 @@ async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> str:
                 break
             CON.print("[bold yellow]⚠ no <progress> tag found in response[/]")
 
-        # ── update progress for next iteration ──
+        # ── update progress for next iteration + record trace ──
         if parsed:
             progress = parsed
             CON.print(f"[bold green]progress out:[/] {progress[:200]}{'…' if len(progress)>200 else ''}")
         else:
             CON.print("[bold red]<progress> parse failed after retries — keeping previous progress[/]")
+
+        _TRACES.append(_IterData(
+            iteration=iteration,
+            progress_in=progress_before,
+            response=result,
+            progress_out=parsed or "",
+        ))
 
         # ── cooldown (skip on last) ──
         last = cfg.MAX_ITERATIONS > 0 and iteration >= cfg.MAX_ITERATIONS
@@ -558,6 +597,73 @@ def _test_config_progress_retries() -> None:
     _t("PROGRESS_RETRIES override", c2.PROGRESS_RETRIES == 5)
 
 
+def _test_parse_verdict() -> None:
+    """R16: _parse_verdict extracts PASS/FAIL from judge output."""
+    ok, reason = _parse_verdict("PASS: The DONE list grows across all iterations.")
+    _t("parse PASS verdict", ok is True)
+    _t("parse PASS reason", "grows" in reason)
+
+    ok2, reason2 = _parse_verdict("FAIL: Iteration 2 repeated iteration 1 content.")
+    _t("parse FAIL verdict", ok2 is False)
+    _t("parse FAIL reason", "repeated" in reason2)
+
+    ok3, reason3 = _parse_verdict("Some preamble\nPASS: Still works after preamble.")
+    _t("parse with preamble", ok3 is True)
+
+    ok4, reason4 = _parse_verdict("gibberish without verdict")
+    _t("unparseable returns False", ok4 is False)
+    _t("unparseable has error msg", "unparseable" in reason4)
+
+
+def _test_eval_concise_progress() -> None:
+    """R16: programmatic concise_progress check."""
+    # ── all under 500 → pass ──
+    good = [
+        _IterData(1, "in", "resp" * 100, "DONE: x\nCURRENT: y\nNEXT: z\nBLOCKERS: none"),
+        _IterData(2, "in", "resp" * 100, "DONE: x, y\nCURRENT: z\nNEXT: a\nBLOCKERS: none"),
+    ]
+    ok, _ = _eval_concise_progress(good)
+    _t("concise good traces pass", ok)
+
+    # ── over 500 → fail ──
+    bad = [_IterData(1, "in", "resp", "X" * 501)]
+    ok2, reason2 = _eval_concise_progress(bad)
+    _t("concise over-500 fails", not ok2)
+    _t("concise fail mentions limit", "500" in reason2)
+
+    # ── bloat 4x → fail ──
+    bloat = [
+        _IterData(1, "in", "resp", "short"),
+        _IterData(2, "in", "resp", "short" * 4),
+    ]
+    ok3, _ = _eval_concise_progress(bloat)
+    _t("concise bloat 4x fails", not ok3)
+
+
+def _test_eval_structured_format() -> None:
+    """R16: programmatic structured_format check."""
+    good = [_IterData(1, "", "", "DONE: a\nCURRENT: b\nNEXT: c\nBLOCKERS: none")]
+    ok, _ = _eval_structured_format(good)
+    _t("structured good trace passes", ok)
+
+    bad = [_IterData(1, "", "", "DONE: a\nNEXT: c")]
+    ok2, reason2 = _eval_structured_format(bad)
+    _t("structured missing fields fails", not ok2)
+    _t("structured fail lists missing", "CURRENT" in reason2 or "missing" in reason2.lower())
+
+
+def _test_eval_no_context_bleed() -> None:
+    """R16: programmatic no_context_bleed check."""
+    good = [_IterData(1, "", "A" * 1000, "DONE: short summary")]
+    ok, _ = _eval_no_context_bleed(good)
+    _t("no_bleed good passes", ok)
+
+    bad = [_IterData(1, "", "A" * 100, "A" * 60)]  # 60% ratio
+    ok2, reason2 = _eval_no_context_bleed(bad)
+    _t("no_bleed >50% fails", not ok2)
+    _t("no_bleed fail mentions bleed", "bleed" in reason2.lower())
+
+
 # ─── integration tests (API calls) ───────────────────────────
 
 async def _test_llm_joke() -> None:
@@ -629,6 +735,10 @@ async def _run_tests() -> None:
     _test_iteration_context()
     _test_parse_progress()
     _test_config_progress_retries()
+    _test_parse_verdict()
+    _test_eval_concise_progress()
+    _test_eval_structured_format()
+    _test_eval_no_context_bleed()
 
     CON.rule("[bold magenta]INTEGRATION TESTS (API calls)[/]")
     await _test_llm_joke()
@@ -641,6 +751,248 @@ async def _run_tests() -> None:
     color = "green" if _FAIL == 0 else "red"
     CON.print(f"[bold {color}]{_PASS} passed, {_FAIL} failed[/]  |  {wall:.1f}s total")
     if _FAIL > 0:
+        sys.exit(1)
+
+
+# ─────────────── EVALS: LLM JUDGE TENETS ─────────────────────
+# Run via: uv run llm_fw.py --eval
+# Runs a 3-iteration ralph loop, then evaluates each tenet
+# with a mix of programmatic checks + LLM-as-judge calls.
+# Output: structured PASS|FAIL + justification per tenet.
+
+_JUDGE_RE = re.compile(r"^(PASS|FAIL):\s*(.+)", re.MULTILINE)
+
+JUDGE_PROMPT = (
+    "You are an eval judge. You evaluate whether an AI agent loop followed a design tenet.\n"
+    "You will be given the tenet description and the iteration data.\n\n"
+    "Respond with EXACTLY ONE line in this format:\n"
+    "PASS: <1-sentence justification>\n"
+    "or\n"
+    "FAIL: <1-sentence justification>\n\n"
+    "NOTHING ELSE. No preamble, no extra lines. Just the verdict line."
+)
+
+
+def _judge_prompt(tenet_name: str, tenet_desc: str, data: str) -> str:
+    """Build the full judge prompt for one tenet evaluation."""
+    return (
+        f"{JUDGE_PROMPT}\n\n"
+        f"TENET: {tenet_name}\n"
+        f"DESCRIPTION: {tenet_desc}\n\n"
+        f"ITERATION DATA:\n{data}"
+    )
+
+
+def _parse_verdict(text: str) -> tuple[bool, str]:
+    """Parse PASS|FAIL: justification from judge output. Returns (passed, reason)."""
+    m = _JUDGE_RE.search(text)
+    if m:
+        return (m.group(1) == "PASS", m.group(2).strip())
+    return (False, f"judge output unparseable: {text[:200]}")
+
+
+def _fmt_traces(traces: list[_IterData]) -> str:
+    """Format traces for judge consumption — concise, numbered."""
+    parts: list[str] = []
+    for t in traces:
+        parts.append(
+            f"--- iteration {t.iteration} ---\n"
+            f"PROGRESS_IN ({len(t.progress_in)} chars):\n{t.progress_in}\n\n"
+            f"RESPONSE ({len(t.response)} chars):\n{t.response[:1500]}{'…' if len(t.response)>1500 else ''}\n\n"
+            f"PROGRESS_OUT ({len(t.progress_out)} chars):\n{t.progress_out}\n"
+        )
+    return "\n".join(parts)
+
+
+# ─── programmatic tenet checks ───────────────────────────────
+
+def _eval_concise_progress(traces: list[_IterData]) -> tuple[bool, str]:
+    """TENET: Progress blocks must stay under 500 chars and not bloat."""
+    if not traces:
+        return (False, "no traces collected")
+    sizes = [len(t.progress_out) for t in traces]
+    max_sz = max(sizes)
+    # check absolute limit
+    if max_sz > 500:
+        return (False, f"progress block hit {max_sz} chars (limit 500)")
+    # check for bloat: last shouldn't be >3x first (if >1 iteration)
+    if len(sizes) > 1 and sizes[0] > 0 and sizes[-1] > sizes[0] * 3:
+        return (False, f"progress bloated from {sizes[0]} to {sizes[-1]} chars ({sizes[-1]/sizes[0]:.1f}x)")
+    return (True, f"all progress blocks under 500 chars, max={max_sz}")
+
+
+def _eval_structured_format(traces: list[_IterData]) -> tuple[bool, str]:
+    """TENET: Every progress block must have DONE/CURRENT/NEXT/BLOCKERS."""
+    required = ["DONE:", "CURRENT:", "NEXT:", "BLOCKERS:"]
+    for t in traces:
+        if not t.progress_out:
+            return (False, f"iteration {t.iteration} has empty progress_out")
+        missing = [f for f in required if f not in t.progress_out.upper()]
+        if missing:
+            return (False, f"iteration {t.iteration} missing fields: {missing}")
+    return (True, f"all {len(traces)} iterations have all 4 required fields")
+
+
+def _eval_no_context_bleed(traces: list[_IterData]) -> tuple[bool, str]:
+    """TENET: Progress must NOT contain the full previous response.
+
+    Heuristic: progress_out should be <30% of response length.
+    If progress is >50% of response, the model is stuffing context.
+    """
+    for t in traces:
+        if not t.response:
+            continue
+        ratio = len(t.progress_out) / max(len(t.response), 1)
+        if ratio > 0.5:
+            return (False, f"iteration {t.iteration}: progress is {ratio:.0%} of response length — context bleed")
+    return (True, "progress blocks are concise relative to responses")
+
+
+# ─── LLM judge tenet checks ──────────────────────────────────
+
+async def _eval_incremental_value(traces: list[_IterData], cfg: CONFIG) -> tuple[bool, str]:
+    """TENET: Each iteration must add new DONE items — DONE list grows monotonically."""
+    data = _fmt_traces(traces)
+    prompt = _judge_prompt(
+        "incremental_value",
+        (
+            "Each iteration must add new DONE items. The DONE list should grow monotonically. "
+            "If iteration N has fewer or identical DONE items compared to iteration N-1, that's a FAIL. "
+            "The agent should NOT repeat work — each iteration adds new value."
+        ),
+        data,
+    )
+    raw = await llm(prompt, cfg)
+    return _parse_verdict(raw)
+
+
+async def _eval_forward_motion(traces: list[_IterData], cfg: CONFIG) -> tuple[bool, str]:
+    """TENET: NEXT field should change between iterations (not stuck in a loop)."""
+    data = _fmt_traces(traces)
+    prompt = _judge_prompt(
+        "forward_motion",
+        (
+            "The NEXT field in the progress block should change between iterations. "
+            "If iteration N and N+1 have identical NEXT fields, the agent is stuck. "
+            "Minor wording changes are OK, but the intent/focus should shift as work completes."
+        ),
+        data,
+    )
+    raw = await llm(prompt, cfg)
+    return _parse_verdict(raw)
+
+
+async def _eval_no_echo(traces: list[_IterData], cfg: CONFIG) -> tuple[bool, str]:
+    """TENET: Response should not just echo back the system prompt or user task."""
+    data = _fmt_traces(traces)
+    prompt = _judge_prompt(
+        "no_echo",
+        (
+            "The agent's response should contain substantive NEW content — analysis, code, plans, etc. "
+            "It should NOT be mostly a copy/echo of the system prompt, user task, or previous progress. "
+            "The bulk of the response should be original work, not repetition."
+        ),
+        data,
+    )
+    raw = await llm(prompt, cfg)
+    return _parse_verdict(raw)
+
+
+async def _eval_progress_is_summary(traces: list[_IterData], cfg: CONFIG) -> tuple[bool, str]:
+    """TENET: Progress is a concise SUMMARY, not a copy of the response."""
+    data = _fmt_traces(traces)
+    prompt = _judge_prompt(
+        "progress_is_summary_not_copy",
+        (
+            "The <progress> block should be a SHORT summary of state — what's done, what's next. "
+            "It must NOT be a verbatim copy or large excerpt of the response text. "
+            "Think of it as a sticky note, not a transcript. "
+            "If progress_out looks like it contains paragraphs of response text, that's a FAIL."
+        ),
+        data,
+    )
+    raw = await llm(prompt, cfg)
+    return _parse_verdict(raw)
+
+
+# ─── eval runner ──────────────────────────────────────────────
+
+_EVAL_PASS = 0
+_EVAL_FAIL = 0
+
+
+def _ev(name: str, passed: bool, reason: str) -> None:
+    """Record an eval result with rich output."""
+    global _EVAL_PASS, _EVAL_FAIL
+    tag = "[bold green]PASS[/]" if passed else "[bold red]FAIL[/]"
+    CON.print(f"  {tag}  {name}")
+    CON.print(f"        [dim]{reason}[/]")
+    if passed:
+        _EVAL_PASS += 1
+    else:
+        _EVAL_FAIL += 1
+
+
+async def _run_evals() -> None:
+    """Run all tenet evals: collect traces via ralph loop, then judge."""
+    global _EVAL_PASS, _EVAL_FAIL, _TRACES
+    _EVAL_PASS, _EVAL_FAIL = 0, 0
+    t0 = time.perf_counter()
+
+    # ── step 1: run a 3-iteration ralph loop to collect data ──
+    CON.rule("[bold magenta]EVAL: collecting iteration data (3 iters)[/]")
+    _TRACES.clear()
+    eval_cfg = CONFIG(MAX_ITERATIONS=3, LOOP_COOLDOWN=0.5, MAX_TOKENS=1024)
+    eval_prompt = (
+        "Design a simple key-value store in Python.\n"
+        "1. Define the API: get, set, delete, list_keys.\n"
+        "2. Write the class with type hints.\n"
+        "3. Write 3 pytest tests.\n"
+        "4. Review and suggest improvements."
+    )
+    await ralph_loop(eval_prompt, eval_cfg)
+
+    if not _TRACES:
+        CON.print("[bold red]no traces collected — cannot evaluate[/]")
+        sys.exit(1)
+
+    CON.print(f"\n[bold]collected {len(_TRACES)} iteration traces[/]\n")
+
+    # ── step 2: programmatic tenets ──
+    CON.rule("[bold magenta]EVAL: programmatic tenets[/]")
+
+    ok, reason = _eval_concise_progress(_TRACES)
+    _ev("concise_progress: <500 chars, no bloat", ok, reason)
+
+    ok, reason = _eval_structured_format(_TRACES)
+    _ev("structured_format: DONE/CURRENT/NEXT/BLOCKERS", ok, reason)
+
+    ok, reason = _eval_no_context_bleed(_TRACES)
+    _ev("no_context_bleed: progress < 50% of response", ok, reason)
+
+    # ── step 3: LLM judge tenets ──
+    CON.rule("[bold magenta]EVAL: LLM judge tenets[/]")
+    judge_cfg = CONFIG(MAX_TOKENS=256, TEMPERATURE=0.0)
+
+    ok, reason = await _eval_incremental_value(_TRACES, judge_cfg)
+    _ev("incremental_value: DONE grows monotonically", ok, reason)
+
+    ok, reason = await _eval_forward_motion(_TRACES, judge_cfg)
+    _ev("forward_motion: NEXT changes between iters", ok, reason)
+
+    ok, reason = await _eval_no_echo(_TRACES, judge_cfg)
+    _ev("no_echo: response is substantive, not parroting", ok, reason)
+
+    ok, reason = await _eval_progress_is_summary(_TRACES, judge_cfg)
+    _ev("progress_is_summary: sticky note, not transcript", ok, reason)
+
+    # ── results ──
+    wall = time.perf_counter() - t0
+    CON.rule("[bold magenta]EVAL RESULTS[/]")
+    total = _EVAL_PASS + _EVAL_FAIL
+    color = "green" if _EVAL_FAIL == 0 else "red"
+    CON.print(f"[bold {color}]{_EVAL_PASS}/{total} tenets passed, {_EVAL_FAIL} failed[/]  |  {wall:.1f}s total")
+    if _EVAL_FAIL > 0:
         sys.exit(1)
 
 
@@ -669,6 +1021,8 @@ def _run_example(name: str) -> None:
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--tests":
         asyncio.run(_run_tests())
+    elif len(sys.argv) > 1 and sys.argv[1] == "--eval":
+        asyncio.run(_run_evals())
     elif len(sys.argv) > 1 and sys.argv[1] == "--example":
         name = sys.argv[2] if len(sys.argv) > 2 else "list"
         _run_example(name)
@@ -679,5 +1033,6 @@ if __name__ == "__main__":
         CON.rule("[bold magenta]llm_fw.py — Fireworks oss120b[/]")
         CON.print('  [bold cyan]uv run llm_fw.py "prompt"[/]         ralph loop')
         CON.print("  [bold cyan]uv run llm_fw.py --tests[/]          run all tests")
+        CON.print("  [bold cyan]uv run llm_fw.py --eval[/]           LLM-judge tenet evals")
         CON.print("  [bold cyan]uv run llm_fw.py --example list[/]   list example prompts")
         CON.print("  [bold cyan]uv run llm_fw.py --example NAME[/]   run example (3 iters)")
