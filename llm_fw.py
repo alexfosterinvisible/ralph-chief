@@ -3,7 +3,7 @@
 
 Usage:
     uv run llm_fw.py "your prompt here"       # ralph loop
-    uv run llm_fw.py --example code_review    # run example prompt (3 iters)
+    uv run llm_fw.py --example code_review    # run example (agent decides when done)
     uv run llm_fw.py --example list           # list available examples
     uv run llm_fw.py --tests                  # run all tests (unit + integration)
     uv run llm_fw.py --eval                   # LLM-judge tenet evaluations
@@ -104,9 +104,14 @@ class CONFIG:
         "<progress>\n"
         "DONE: bullet list of completed items\n"
         "CURRENT: what you worked on this iteration\n"
-        "NEXT: what the next iteration should focus on\n"
+        "NEXT: what the next iteration should focus on (or 'DONE' if task is complete)\n"
         "BLOCKERS: any issues (or 'none')\n"
         "</progress>\n\n"
+        # ── termination ──
+        "TERMINATION:\n"
+        "- When the task is FULLY COMPLETE, set NEXT: DONE in your <progress> tag.\n"
+        "- The loop will stop automatically when it sees NEXT: DONE.\n"
+        "- Do NOT stop early — only signal DONE when all sub-tasks are finished.\n\n"
         # ── quality ──
         "RULES:\n"
         "- Each iteration must add new value — do NOT repeat previous work.\n"
@@ -256,6 +261,8 @@ async def _call(prompt: str, cfg: CONFIG) -> str:
 
         elapsed = time.perf_counter() - t0
         text = "".join(chunks)
+        if ttft is None:
+            ttft = elapsed  # no chunks received
 
         # ── compact summary line ──
         CON.print(
@@ -422,6 +429,11 @@ async def ralph_loop(prompt: str, cfg: CONFIG = CFG) -> str:
             response=result,
             progress_out=parsed or "",
         ))
+
+        # ── agent signals completion via NEXT: DONE ──
+        if parsed and re.search(r"NEXT:\s*DONE\b", parsed, re.IGNORECASE):
+            CON.rule(f"[bold green]agent signalled DONE after {iteration} iterations[/]")
+            break
 
         # ── cooldown (skip on last) ──
         last = cfg.MAX_ITERATIONS > 0 and iteration >= cfg.MAX_ITERATIONS
@@ -791,16 +803,34 @@ def _parse_verdict(text: str) -> tuple[bool, str]:
     return (False, f"judge output unparseable: {text[:200]}")
 
 
-def _fmt_traces(traces: list[_IterData]) -> str:
-    """Format traces for judge consumption — concise, numbered."""
+async def _judge_with_retry(prompt: str, cfg: CONFIG, retries: int = 2) -> tuple[bool, str]:
+    """Call LLM judge with retries on empty/unparseable responses."""
+    for attempt in range(1 + retries):
+        raw = await llm(prompt, cfg)
+        ok, reason = _parse_verdict(raw)
+        if "unparseable" not in reason:
+            return (ok, reason)
+        if attempt < retries:
+            CON.print(f"[dim]judge retry {attempt+1}/{retries} — empty/unparseable response[/]")
+    return (ok, reason)
+
+
+def _fmt_traces(traces: list[_IterData], include_response: bool = True) -> str:
+    """Format traces for judge consumption — concise, numbered.
+
+    Set include_response=False for judges that only need progress blocks.
+    """
     parts: list[str] = []
     for t in traces:
-        parts.append(
+        block = (
             f"--- iteration {t.iteration} ---\n"
-            f"PROGRESS_IN ({len(t.progress_in)} chars):\n{t.progress_in}\n\n"
-            f"RESPONSE ({len(t.response)} chars):\n{t.response[:1500]}{'…' if len(t.response)>1500 else ''}\n\n"
-            f"PROGRESS_OUT ({len(t.progress_out)} chars):\n{t.progress_out}\n"
+            f"PROGRESS_IN:\n{t.progress_in}\n\n"
         )
+        if include_response:
+            resp_trunc = t.response[:800] + ("…" if len(t.response) > 800 else "")
+            block += f"RESPONSE ({len(t.response)} chars, first 800):\n{resp_trunc}\n\n"
+        block += f"PROGRESS_OUT:\n{t.progress_out}\n"
+        parts.append(block)
     return "\n".join(parts)
 
 
@@ -852,7 +882,7 @@ def _eval_no_context_bleed(traces: list[_IterData]) -> tuple[bool, str]:
 
 async def _eval_incremental_value(traces: list[_IterData], cfg: CONFIG) -> tuple[bool, str]:
     """TENET: Each iteration must add new DONE items — DONE list grows monotonically."""
-    data = _fmt_traces(traces)
+    data = _fmt_traces(traces, include_response=False)
     prompt = _judge_prompt(
         "incremental_value",
         (
@@ -862,13 +892,12 @@ async def _eval_incremental_value(traces: list[_IterData], cfg: CONFIG) -> tuple
         ),
         data,
     )
-    raw = await llm(prompt, cfg)
-    return _parse_verdict(raw)
+    return await _judge_with_retry(prompt, cfg)
 
 
 async def _eval_forward_motion(traces: list[_IterData], cfg: CONFIG) -> tuple[bool, str]:
     """TENET: NEXT field should change between iterations (not stuck in a loop)."""
-    data = _fmt_traces(traces)
+    data = _fmt_traces(traces, include_response=False)
     prompt = _judge_prompt(
         "forward_motion",
         (
@@ -878,8 +907,7 @@ async def _eval_forward_motion(traces: list[_IterData], cfg: CONFIG) -> tuple[bo
         ),
         data,
     )
-    raw = await llm(prompt, cfg)
-    return _parse_verdict(raw)
+    return await _judge_with_retry(prompt, cfg)
 
 
 async def _eval_no_echo(traces: list[_IterData], cfg: CONFIG) -> tuple[bool, str]:
@@ -894,8 +922,7 @@ async def _eval_no_echo(traces: list[_IterData], cfg: CONFIG) -> tuple[bool, str
         ),
         data,
     )
-    raw = await llm(prompt, cfg)
-    return _parse_verdict(raw)
+    return await _judge_with_retry(prompt, cfg)
 
 
 async def _eval_progress_is_summary(traces: list[_IterData], cfg: CONFIG) -> tuple[bool, str]:
@@ -911,8 +938,7 @@ async def _eval_progress_is_summary(traces: list[_IterData], cfg: CONFIG) -> tup
         ),
         data,
     )
-    raw = await llm(prompt, cfg)
-    return _parse_verdict(raw)
+    return await _judge_with_retry(prompt, cfg)
 
 
 # ─── eval runner ──────────────────────────────────────────────
@@ -942,7 +968,7 @@ async def _run_evals() -> None:
     # ── step 1: run a 3-iteration ralph loop to collect data ──
     CON.rule("[bold magenta]EVAL: collecting iteration data (3 iters)[/]")
     _TRACES.clear()
-    eval_cfg = CONFIG(MAX_ITERATIONS=3, LOOP_COOLDOWN=0.5, MAX_TOKENS=1024)
+    eval_cfg = CONFIG(MAX_ITERATIONS=3, LOOP_COOLDOWN=0.5, MAX_TOKENS=2048)
     eval_prompt = (
         "Design a simple key-value store in Python.\n"
         "1. Define the API: get, set, delete, list_keys.\n"
@@ -999,7 +1025,7 @@ async def _run_evals() -> None:
 # ─────────────── EXAMPLE RUNNER / GUARDMAIN ──────────────────
 
 def _run_example(name: str) -> None:
-    """Run a named example prompt through the ralph loop (3 iterations)."""
+    """Run a named example prompt through the ralph loop (max 100 iterations)."""
     if name == "list":
         CON.rule("[bold magenta]available example prompts[/]")
         for n in PROMPTS.names():
@@ -1013,8 +1039,8 @@ def _run_example(name: str) -> None:
         CON.print(f"[dim]available: {', '.join(PROMPTS.names())}[/]")
         sys.exit(1)
 
-    CON.print(f"[bold green]running example:[/] {name} (3 iterations)\n")
-    cfg = CONFIG(MAX_ITERATIONS=3, LOOP_COOLDOWN=0.5)
+    CON.print(f"[bold green]running example:[/] {name} (max 100 iterations — agent decides when done)\n")
+    cfg = CONFIG(MAX_ITERATIONS=100, LOOP_COOLDOWN=0.5)
     asyncio.run(ralph_loop(prompt, cfg))
 
 
