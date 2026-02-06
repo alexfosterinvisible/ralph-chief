@@ -14,16 +14,79 @@ Usage:
     uv run llm_fw_v2_ABAB.py                     # help
 
 Requirements:
+
 ☑️✅🧪 R1: parse_artifacts — extract named <artifact> blocks from LLM output
+  ☑️✅🧪 R1.1: single artifact extraction (name + content)
+  ☑️✅🧪 R1.2: multiple artifacts in one response
+  ☑️✅🧪 R1.3: empty dict when no artifacts present
+  ☑️✅🧪 R1.4: single-quoted and double-quoted name attrs
+  ☑️✅🧪 R1.5: content whitespace stripping
+  ☑️✅🧪 R1.6: duplicate names → last wins (overwrite)
 ☑️✅🧪 R2: parse_scratchpad — extract <scratchpad> (ephemeral, discarded)
+  ☑️✅🧪 R2.1: basic extraction
+  ☑️✅🧪 R2.2: case-insensitive tags
+  ☑️✅🧪 R2.3: multiline content
+  ☑️✅🧪 R2.4: None for missing, "" for empty tag
 ☑️✅🧪 R3: parse_promise — extract <promise> block
+  ☑️✅🧪 R3.1: basic extraction
+  ☑️✅🧪 R3.2: case-insensitive tags
+  ☑️✅🧪 R3.3: multiline content
+  ☑️✅🧪 R3.4: None for missing
 ☑️✅🧪 R4: parse_requirements — extract R1..Rn from R-step output
+  ☑️✅🧪 R4.1: extracts from <requirements> block
+  ☑️✅🧪 R4.2: parses R{n}: desc format per line → Req dataclass
+  ☑️✅🧪 R4.3: empty list when no block
+  ☑️✅🧪 R4.4: whitespace stripping on desc
 ☑️✅🧪 R5: parse_tests — extract T1..Tn (unit/judge) from R-step output
+  ☑️✅🧪 R5.1: extracts from <tests> block
+  ☑️✅🧪 R5.2: parses T{n}: unit|judge: desc format → Test dataclass
+  ☑️✅🧪 R5.3: lowercases kind field
+  ☑️✅🧪 R5.4: empty list when no block
 ☑️✅🧪 R6: parse_rubric — extract PASS|FAIL per R/T from judge output
+  ☑️✅🧪 R6.1: parses R{n}/T{n}: PASS|FAIL: reason → Score dataclass
+  ☑️✅🧪 R6.2: fmt_score computes (passed, total, pct)
+  ☑️✅🧪 R6.3: fmt_failures formats only failing scores for injection
+  ☑️✅🧪 R6.4: empty list when no scores parseable
 ☑️✅ R7: ralph_loop_v2 — R→A→B→prog→A architecture
-☑️✅ R8: WORKER_PROMPT / JUDGE_PROMPT / REQ_PROMPT
-☑️✅ R9: Harness-controlled termination (100% score, not LLM DONE)
-☑️✅ R10: Artifacts persist, scratchpad discarded, context bounded
+  ☑️✅ R7.1: R-step: one-shot requirement+test extraction via REQ_PROMPT
+  ☑️✅ R7.2: A-step: worker produces artifacts + scratchpad + promise
+  ☑️✅ R7.3: B-step: judge scores all R/T as PASS|FAIL with reasons
+  ☑️✅ R7.4: prog: parse rubric, check 100%, format failures for next A
+  ☑️✅ R7.5: failure injection: only failing scores fed back to worker
+  ☑️✅ R7.6: graceful handling when judge returns empty/unparseable
+☑️✅ R8: Prompt engineering — three distinct role prompts
+  ☑️✅ R8.1: REQ_PROMPT instructs structured requirement+test extraction
+  ☑️✅ R8.2: WORKER_PROMPT instructs artifact+scratchpad+promise output
+  ☑️✅ R8.3: JUDGE_PROMPT instructs per-item PASS|FAIL rubric scoring
+☑️✅ R9: Harness-controlled termination (not LLM DONE)
+  ☑️✅ R9.1: 100% rubric score → done
+  ☑️✅ R9.2: stall detection (score plateau for STALL_LIMIT iters → stop)
+  ☑️✅ R9.3: MAX_ITERATIONS hard cap
+☑️✅ R10: Context bounding — artifacts persist, scratchpad discarded
+  ☑️✅ R10.1: artifacts dict persists across iterations (update/overwrite)
+  ☑️✅ R10.2: scratchpad parsed but NOT injected into next iteration
+  ☑️✅ R10.3: only artifacts + failures injected (bounded context growth)
+☑️✅ R11: CONFIG dataclass — all tunable params in one place
+  ☑️✅ R11.1: model/API fields (MODEL, BASE_URL, API_KEY from env)
+  ☑️✅ R11.2: generation fields (MAX_TOKENS, TEMPERATURE, STREAM)
+  ☑️✅ R11.3: ABAB loop fields (MAX_ITERATIONS, STALL_LIMIT, LOOP_COOLDOWN)
+☑️✅ R12: LLM infrastructure (inherited from v1)
+  ☑️✅ R12.1: streaming with TTFT measurement
+  ☑️✅ R12.2: tenacity exp-backoff retries on rate limit
+  ☑️✅ R12.3: asyncio.Semaphore for concurrency control
+  ☑️✅ R12.4: Rich console output with color
+☑️✅ R13: Per-step logging with absolute paths
+  ☑️✅ R13.1: R/A/B step labels + timestamps in logfile
+  ☑️✅ R13.2: absolute log path printed to console
+☑️✅ R14: CLI interface
+  ☑️✅ R14.1: --tests runs unit + integration tests
+  ☑️✅ R14.2: --eval runs full ABAB eval (kv-store task)
+  ☑️✅ R14.3: positional arg runs ABAB loop with task
+  ☑️✅ R14.4: no args shows help
+☑️✅🧪 R15: Structured dataclasses for parsed data
+  ☑️✅🧪 R15.1: Req(id, desc) for requirements
+  ☑️✅🧪 R15.2: Test(id, kind, desc) for acceptance tests
+  ☑️✅🧪 R15.3: Score(id, passed, reason) for rubric results
 ⛔ Tool-use / function-calling
 """
 # /// script
