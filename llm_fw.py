@@ -5,6 +5,7 @@ Usage:
     uv run llm_fw.py "your prompt here"       # ralph loop
     uv run llm_fw.py --example code_review    # run example prompt (3 iters)
     uv run llm_fw.py --example list           # list available examples
+    uv run llm_fw.py --tests                  # run all tests (unit + integration)
     uv run llm_fw.py                          # smoke-test demo
 
 Requirements:
@@ -20,6 +21,7 @@ Requirements:
 ☑️ R10: AGENT_PROMPT in CONFIG, read fresh each iteration
 ☑️ R11: PROMPTS class w/ example prompts (tuple format)
 ☑️ R12: MAX_ITERATIONS for bounded loop runs (0 = infinite)
+☑️ R13: --tests runs all unit + integration tests in-file
 ⛔ Tool-use / function-calling
 ⛔ Multi-turn memory (stateless per call)
 """
@@ -220,7 +222,7 @@ def _client() -> AsyncOpenAI:
     reraise=True,
 )
 async def _call(prompt: str, cfg: CONFIG) -> str:
-    """Single LLM call with streaming + retry."""
+    """Single LLM call with streaming + retry.  Streams tokens live to terminal."""
     async with _sem():
         t0 = time.perf_counter()
         chunks: list[str] = []
@@ -234,28 +236,25 @@ async def _call(prompt: str, cfg: CONFIG) -> str:
             stream=cfg.STREAM,
         )
 
+        # ── live-stream tokens to terminal ──
+        CON.print(f"[bold cyan]{cfg.MODEL.split('/')[-1]}[/] ", end="")
         async for chunk in stream:
             delta = chunk.choices[0].delta.content if chunk.choices[0].delta else None
             if delta:
                 if ttft is None:
                     ttft = time.perf_counter() - t0
                 chunks.append(delta)
+                print(delta, end="", flush=True)
+        print()  # newline after stream
 
         elapsed = time.perf_counter() - t0
         text = "".join(chunks)
 
-        # ── rich summary ──
+        # ── compact summary line ──
         CON.print(
-            Panel(
-                Text(text, style="white"),
-                title=f"[bold cyan]{cfg.MODEL.split('/')[-1]}[/]",
-                subtitle=(
-                    f"[dim]{len(text)} chars  |  "
-                    f"TTFT {ttft:.2f}s  |  "
-                    f"total {elapsed:.2f}s[/]"
-                ),
-                border_style="green",
-            )
+            f"[dim]── {len(text)} chars  |  "
+            f"TTFT {ttft:.2f}s  |  "
+            f"total {elapsed:.2f}s ──[/]"
         )
         return text
 
