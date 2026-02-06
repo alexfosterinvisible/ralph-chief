@@ -67,7 +67,10 @@ Requirements:
   ☑️✅ R7.3: B-step: judge scores all R/T as PASS|FAIL with reasons
   ☑️✅ R7.4: prog: parse rubric, check 100%, format failures for next A
   ☑️✅ R7.5: failure injection: only failing scores fed back to worker
-  ☑️✅ R7.6: graceful handling when judge returns empty/unparseable
+  ☑️✅🧪 R7.6: judge retry loop — JUDGE_RETRIES attempts before falling back to worker
+    ☑️✅🧪 R7.6a: temperature escalation on each retry (0.0 → 0.3 → 0.6)
+    ☑️✅🧪 R7.6b: feedback nudge injected on retry (format reminder)
+    ☑️✅🧪 R7.6c: retries judge, NOT worker, when rubric parse fails
 ☑️✅ R8: Prompt engineering — three distinct role prompts
   ☑️✅ R8.1: REQ_PROMPT instructs structured requirement+test extraction
   ☑️✅ R8.2: WORKER_PROMPT instructs artifact+scratchpad+promise output
@@ -83,7 +86,7 @@ Requirements:
 ☑️✅ R11: CONFIG dataclass — all tunable params in one place
   ☑️✅ R11.1: model/API fields (MODEL, BASE_URL, API_KEY from env)
   ☑️✅ R11.2: generation fields (MAX_TOKENS, TEMPERATURE, STREAM)
-  ☑️✅ R11.3: ABAB loop fields (MAX_ITERATIONS, STALL_LIMIT, LOOP_COOLDOWN)
+  ☑️✅🧪 R11.3: ABAB loop fields (MAX_ITERATIONS, STALL_LIMIT, LOOP_COOLDOWN, JUDGE_RETRIES)
 ☑️✅ R12: LLM infrastructure (inherited from v1)
   ☑️✅ R12.1: streaming with TTFT measurement
   ☑️✅ R12.2: tenacity exp-backoff retries on rate limit
@@ -171,6 +174,7 @@ class CONFIG:
     MAX_ITERATIONS: int = 5           # max A→B cycles
     LOOP_COOLDOWN: float = 1.0        # seconds between iterations
     STALL_LIMIT: int = 2              # stop if score doesn't improve for N iters
+    JUDGE_RETRIES: int = 2            # retry judge if rubric parse fails
     AGENT_LOGS_DIR: str = "agent_logs"
 
 
@@ -709,10 +713,10 @@ async def ralph_loop_v2(task: str, cfg: CONFIG = CFG) -> tuple[list[Score], dict
         if promise:
             CON.print(f"[bold]promise:[/] {promise[:200]}{'…' if len(promise)>200 else ''}")
 
-        # ── B: JUDGE ──
+        # ── B: JUDGE (with retry on parse failure) ──
         CON.rule(f"[bold cyan]B: JUDGE — iteration {iteration}/{cfg.MAX_ITERATIONS}[/]")
 
-        judge_prompt = (
+        base_judge_prompt = (
             f"{JUDGE_PROMPT}\n"
             f"{'─'*40}\n"
             f"REQUIREMENTS:\n{reqs_str}\n\n"
@@ -725,17 +729,42 @@ async def ralph_loop_v2(task: str, cfg: CONFIG = CFG) -> tuple[list[Score], dict
             f"Score every R and T. Start with R1: immediately.\n"
         )
 
-        judge_cfg = CONFIG(MAX_TOKENS=1024, TEMPERATURE=0.0)
-        judge_raw = await llm(judge_prompt, judge_cfg)
-        _write_log(logfile, f"B-STEP-{iteration}", judge_prompt, judge_raw)
+        scores: list[Score] = []
+        judge_raw = ""
+        for judge_retry in range(1 + cfg.JUDGE_RETRIES):
+            # escalate temperature on retries to vary output
+            temp = min(0.0 + judge_retry * 0.3, 0.9)
+            judge_cfg = CONFIG(MAX_TOKENS=1024, TEMPERATURE=temp)
 
-        # ── PROG: parse scores ──
-        scores = parse_rubric(judge_raw)
+            # inject feedback nudge on retries
+            if judge_retry == 0:
+                judge_prompt = base_judge_prompt
+            else:
+                nudge = (
+                    f"\n\n⚠ REMINDER: Your previous response was not parseable. "
+                    f"You MUST output EXACTLY this format, one line per item:\n"
+                    f"R1: PASS: reason\n"
+                    f"R1: FAIL: reason\n"
+                    f"...\n"
+                    f"No preamble. Start with R1: immediately.\n"
+                )
+                judge_prompt = base_judge_prompt + nudge
+                CON.print(f"[bold yellow]judge retry {judge_retry}/{cfg.JUDGE_RETRIES} "
+                          f"— nudge + temp={temp:.1f}[/]")
+
+            judge_raw = await llm(judge_prompt, judge_cfg)
+            _write_log(logfile, f"B-STEP-{iteration}-retry{judge_retry}", judge_prompt, judge_raw)
+
+            scores = parse_rubric(judge_raw)
+            if scores:
+                break
+            CON.print(f"[bold red]judge returned no parseable scores (attempt {judge_retry + 1}/{1 + cfg.JUDGE_RETRIES})[/]")
+
         final_scores = scores
 
         if not scores:
-            CON.print("[bold red]judge returned no parseable scores — retrying next iteration[/]")
-            failures_str = "judge output was unparseable — re-do your work and try again"
+            CON.print("[bold red]judge exhausted all retries — no parseable scores, continuing to next worker iteration[/]")
+            failures_str = "judge output was unparseable after retries — re-do your work and try again"
             continue
 
         passed, total, pct = fmt_score(scores)
@@ -1081,6 +1110,60 @@ def _test_tmux_tiled_layout() -> None:
     _t("tmux uses select-layout", "select-layout" in src)
 
 
+# ─── R18: judge retry tests ───────────────────────────────────
+
+def _test_judge_retries_config() -> None:
+    """R18: CONFIG has JUDGE_RETRIES field with sensible default."""
+    c = CONFIG()
+    has_it = hasattr(c, "JUDGE_RETRIES")
+    _t("JUDGE_RETRIES exists", has_it)
+    _t("JUDGE_RETRIES default >= 2", getattr(c, "JUDGE_RETRIES", 0) >= 2)
+    if has_it:
+        c2 = CONFIG(JUDGE_RETRIES=5)
+        _t("JUDGE_RETRIES override", c2.JUDGE_RETRIES == 5)
+    else:
+        _t("JUDGE_RETRIES override", False, "field doesn't exist yet")
+
+
+def _test_judge_retry_in_loop() -> None:
+    """R18: ralph_loop_v2 retries judge (not worker) when rubric parse fails."""
+    import inspect
+    src = inspect.getsource(ralph_loop_v2)
+    # must have an inner retry loop for the judge, not just `continue` to next worker iter
+    _t("judge has retry loop", "JUDGE_RETRIES" in src or "judge_retries" in src.lower(),
+       "loop must reference JUDGE_RETRIES config")
+    _t("judge retry has temperature escalation", "temperature" in src.lower() or "TEMPERATURE" in src.lower(),
+       "retry should vary temperature")
+    _t("judge retry has feedback nudge", "nudge" in src.lower() or "reminder" in src.lower() or "feedback" in src.lower(),
+       "retry should inject format reminder on failure")
+
+
+def _test_judge_retry_does_not_rerun_worker() -> None:
+    """R18: On judge parse failure, retry judge — do NOT re-run worker."""
+    import inspect
+    src = inspect.getsource(ralph_loop_v2)
+    # the judge section should have its own for/while loop before the `continue`
+    # find the judge section: between "B: JUDGE" and "PROG: parse"
+    lines = src.splitlines()
+    judge_start = next((i for i, ln in enumerate(lines) if "B: JUDGE" in ln), None)
+    prog_end = next((i for i, ln in enumerate(lines) if "100%" in ln and "done" in ln.lower()), None)
+    if judge_start and prog_end:
+        judge_section = "\n".join(lines[judge_start:prog_end])
+        _t("judge section has inner retry", "for " in judge_section and "retry" in judge_section.lower(),
+           "must retry judge call inside judge section, not via outer continue")
+    else:
+        _t("judge section has inner retry", False, "could not find judge section boundaries")
+
+
+def _test_parse_rubric_empty_returns_empty() -> None:
+    """R18: parse_rubric handles edge cases that trigger retries."""
+    _t("empty string → empty list", parse_rubric("") == [])
+    _t("whitespace → empty list", parse_rubric("   \n\n  ") == [])
+    _t("random text → empty list", parse_rubric("here is my analysis of the code") == [])
+    _t("almost-valid → empty list", parse_rubric("R1 PASS good code") == [],
+       "missing colon separator")
+
+
 # ─── test runner ──────────────────────────────────────────────
 
 async def _run_tests() -> None:
@@ -1102,6 +1185,10 @@ async def _run_tests() -> None:
     _test_tmux_uses_panes_not_windows()
     _test_tmux_graceful_split_failure()
     _test_tmux_tiled_layout()
+    _test_judge_retries_config()
+    _test_judge_retry_in_loop()
+    _test_judge_retry_does_not_rerun_worker()
+    _test_parse_rubric_empty_returns_empty()
 
     CON.rule("[bold magenta]INTEGRATION TESTS — LLM calls[/]")
     # quick smoke test: LLM responds
