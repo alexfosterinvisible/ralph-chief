@@ -8,7 +8,7 @@
                             ABAB gets LoopResult, thread accumulation, eval framework.
                             CONFIG per-step bug fixed (replace() instead of fresh CONFIG()).
                             _ARTIFACT_RE handles unquoted name=foo attrs.
-                            ABAB judge retries on unparseable output (PROGRESS_RETRIES).
+                            ABAB judge retries with temp escalation + nudge (0.0→0.3→0.6).
                             ABAB R-step retries on parse failure (nudge + temp escalation).
                             ABAB evals: 4 programmatic + 3 LLM-judge + 1 thread = 8 (matches AAAA).
 
@@ -89,7 +89,7 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 
-from openai import AsyncOpenAI, RateLimitError, APIStatusError
+from openai import AsyncOpenAI, APIError, RateLimitError, APIStatusError
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -348,7 +348,7 @@ def _client() -> AsyncOpenAI:
 # ─────────────── CORE LLM CALL ───────────────────────────────
 
 @retry(
-    retry=retry_if_exception_type((RateLimitError, APIStatusError)),
+    retry=retry_if_exception_type((APIError, RateLimitError, APIStatusError)),
     stop=stop_after_attempt(CFG.MAX_RETRIES),
     wait=wait_exponential(min=CFG.BACKOFF_MIN, max=CFG.BACKOFF_MAX),
     reraise=True,
@@ -1030,10 +1030,10 @@ async def ralph_loop_abab(task: str, cfg: CONFIG = CFG) -> ABLoopResult:
         if promise:
             CON.print(f"[bold]promise:[/] {promise[:200]}{'…' if len(promise)>200 else ''}")
 
-        # ── B: JUDGE (with retry on unparseable output) ──
+        # ── B: JUDGE (with retry: temp escalation + nudge on parse failure) ──
         CON.rule(f"[bold cyan]B: JUDGE — iteration {iteration}/{cfg.MAX_ITERATIONS}[/]")
 
-        judge_prompt = (
+        base_judge_prompt = (
             f"{AB_JUDGE_PROMPT}\n"
             f"{'─'*40}\n"
             f"REQUIREMENTS:\n{reqs_str}\n\n"
@@ -1046,16 +1046,33 @@ async def ralph_loop_abab(task: str, cfg: CONFIG = CFG) -> ABLoopResult:
             f"Score every R and T. Start with R1: immediately.\n"
         )
 
-        judge_cfg = replace(cfg, MAX_TOKENS=1024, TEMPERATURE=0.0)  # FIX: inherits API_KEY
         scores: list[Score] = []
         for judge_attempt in range(1 + cfg.PROGRESS_RETRIES):
-            if judge_attempt > 0:
-                CON.print(f"[bold yellow]judge retry {judge_attempt}/{cfg.PROGRESS_RETRIES} — unparseable output[/]")
+            # escalate temperature on retries to vary output (0.0 → 0.3 → 0.6)
+            temp = min(0.0 + judge_attempt * 0.3, 0.9)
+            judge_cfg = replace(cfg, MAX_TOKENS=2048, TEMPERATURE=temp)
+
+            if judge_attempt == 0:
+                judge_prompt = base_judge_prompt
+            else:
+                nudge = (
+                    "\n\n⚠ REMINDER: Your previous response was not parseable. "
+                    "You MUST output EXACTLY this format, one line per item:\n"
+                    "R1: PASS: reason\n"
+                    "R1: FAIL: reason\n"
+                    "...\n"
+                    "No preamble. Start with R1: immediately.\n"
+                )
+                judge_prompt = base_judge_prompt + nudge
+                CON.print(f"[bold yellow]judge retry {judge_attempt}/{cfg.PROGRESS_RETRIES} "
+                          f"— nudge + temp={temp:.1f}[/]")
+
             judge_raw = await llm(judge_prompt, judge_cfg)
             _write_log(logfile, f"B-STEP-{iteration}.{judge_attempt}", judge_prompt, judge_raw)
             scores = parse_rubric(judge_raw)
             if scores:
                 break
+            CON.print(f"[bold yellow]⚠ judge returned no parseable scores (attempt {judge_attempt + 1}/{1 + cfg.PROGRESS_RETRIES})[/]")
 
         final_scores = scores
         iter_elapsed = time.perf_counter() - iter_t0
@@ -2321,7 +2338,8 @@ def _run_example(name: str, mode: str = "abab") -> None:
     if mode == "aaaa":
         cfg = replace(CFG, MAX_ITERATIONS=100, LOOP_COOLDOWN=0.5)
     else:
-        cfg = replace(CFG, MAX_ITERATIONS=10, LOOP_COOLDOWN=0.5, MAX_TOKENS=4096)
+        cfg = replace(CFG, MAX_ITERATIONS=10, LOOP_COOLDOWN=0.5,
+                      MAX_TOKENS=4096, STALL_LIMIT=3)
     asyncio.run(_run_with_analysis(prompt, cfg, mode))
 
 

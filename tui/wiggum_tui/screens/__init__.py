@@ -1,1 +1,0 @@
-"""Screens for wiggum TUI."""

@@ -19,3 +19,20 @@ projects/
 # OpenMemory - IDE/Assistant specific rules
 .cursor/rules/openmemory.mdc
 agent_logs/
+.codersinflow
+.vscode
+node_modules
+.env
+.venv
+.codex
+out
+dist
+*.vsix
+.claude
+CLAUDE.md
+.git
+__pycache__
+*.pyc
+.env.local
+.next
+.github
